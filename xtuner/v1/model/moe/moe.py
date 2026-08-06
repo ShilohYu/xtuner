@@ -64,6 +64,13 @@ from xtuner.v1.module import (
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig, MoEBlock, MoEDecoderLayer, MoEGate
 from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
+from xtuner.v1.module.ultraep import (
+    UltraEPConfig,
+    UltraEPManagerProvider,
+    validate_ultraep_fsdp_compatibility,
+    validate_ultraep_moe_compatibility,
+    validate_ultraep_mtp_compatibility,
+)
 from xtuner.v1.utils import (
     get_device,
     get_logger,
@@ -165,6 +172,9 @@ class MoEConfig(TransformerConfig):
     # Compose models call `self.embed_tokens` multiple times per step, so default to
     # keeping it unsharded after forward to avoid repeated all-gathers.
     embed_reshard_after_forward: bool = True
+    # ``None`` keeps the baseline route byte-for-byte independent of UltraEP.
+    # When configured, replicas remain runtime-owned rather than model state.
+    ultraep_cfg: UltraEPConfig | None = None
 
     def build(self) -> "MoE":
         from xtuner.v1.model.moe.moe import MoE
@@ -188,9 +198,22 @@ class MoE(BaseModel):
 
     config: MoEConfig
     ep_mesh: DeviceMesh | None = None
+    ultraep_manager_provider: UltraEPManagerProvider | None = None
 
     def __init__(self, config: MoEConfig):
         super().__init__(config)
+        validate_ultraep_moe_compatibility(
+            config.ultraep_cfg,
+            ep_size=config.ep_size,
+            n_routed_experts=config.n_routed_experts,
+            dispatcher=config.dispatcher,
+            float8_enabled=config.float8_cfg is not None,
+            moe_bias=config.moe_bias,
+        )
+        validate_ultraep_mtp_compatibility(
+            config.ultraep_cfg,
+            mtp_enabled=config.mtp_config is not None,
+        )
         if config.ep_size is not None and config.ep_size > 1:
             world_size = dist.get_world_size()
             self.ep_mesh = init_device_mesh(
@@ -200,6 +223,15 @@ class MoE(BaseModel):
             )[f"{self.config.mesh_prefix}.ep"]
         else:
             self.ep_mesh = None
+
+        if config.ultraep_cfg is not None:
+            assert self.ep_mesh is not None
+            self.ultraep_manager_provider = UltraEPManagerProvider.from_xtuner_config(
+                group=self.ep_mesh.get_group(),
+                config=config,
+            )
+        else:
+            self.ultraep_manager_provider = None
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
@@ -1000,6 +1032,7 @@ class MoE(BaseModel):
                     layer_idx=layer_idx,
                     dispatcher=config.dispatcher,
                     ep_mesh=self.ep_mesh,
+                    ultraep_manager_provider=self.ultraep_manager_provider,
                 )
                 if self.config.freeze_routers:
                     layers[str(layer_idx)].gate.requires_grad_(False)
@@ -1103,6 +1136,7 @@ class MoE(BaseModel):
         self,
         fsdp_config: FSDPConfig,
     ) -> Self:
+        validate_ultraep_fsdp_compatibility(self.config.ultraep_cfg, recompute_ratio=fsdp_config.recompute_ratio)
         self.fsdp_config = fsdp_config
         assert self.fsdp_config.ep_size == self.config.ep_size
         self.mp_policy = MixedPrecisionPolicy(
