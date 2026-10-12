@@ -680,23 +680,21 @@ class BaseModel(nn.Module):
 
                 for hf_name in hf_name_list:
                     if any(re.search(p, hf_name) for p in patterns):  # type: ignore
-                        if not isinstance(param, DTensor):
-                            dist_param = nn.Parameter(
-                                distribute_tensor(
-                                    param, self.world_mesh, [Replicate() for _ in range(self.world_mesh.ndim)]
-                                ),
-                                requires_grad=param.requires_grad,
-                            )
-                            module.register_parameter(name, dist_param)
-                            ignored_params.add(dist_param)
-                        else:
-                            # param is already a DTensor (e.g. distributed by
-                            # MoE._replicate_other_params on ep_mesh before _fully_shard
-                            # is called). We skip re-distributing on world_mesh and just
-                            # add it to ignored_params so FSDP leaves it alone.
-                            # ASSUMPTION: fp32 distribution always happens AFTER any
-                            # prior EP distribution, so the existing placement is correct.
-                            ignored_params.add(param)
+                        # Always rematerialize FP32-ignored params as full-world
+                        # replicas. MoE may have already placed them on an EP-only
+                        # mesh; leaving that layout would desync FSDP-rank grads and
+                        # make global norms / clipping inconsistent. Use full_tensor()
+                        # so both replicated and sharded DTensors become a complete
+                        # local value before redistribute.
+                        local_param = param.full_tensor().detach() if isinstance(param, DTensor) else param
+                        dist_param = nn.Parameter(
+                            distribute_tensor(
+                                local_param, self.world_mesh, [Replicate() for _ in range(self.world_mesh.ndim)]
+                            ),
+                            requires_grad=param.requires_grad,
+                        )
+                        module.register_parameter(name, dist_param)
+                        ignored_params.add(dist_param)
                         break
 
             for child in module.children():
