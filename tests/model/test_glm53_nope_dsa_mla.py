@@ -15,6 +15,7 @@ TestNoPEDSAMLAConfigGuards
 TestNoPEDSAMLAConfigRMSNormEps
     test_eps_reaches_q_and_kv_layernorms                   rms_norm_eps 从 config 传到两个 norm（回归）
     test_default_keeps_legacy_eps                           无 config 值时保持旧 1e-6 行为
+    test_from_hf_eps_reaches_both_norms                     HF 配置文件经 from_hf 传到实际 norm
     test_hf_builds_these_norms_from_the_same_config_eps     HF 同样按 config.rms_norm_eps 构造
 """
 
@@ -23,6 +24,7 @@ import torch
 
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model.moe.glm53 import NoPEDSAMLAConfig
+from xtuner.v1.model.moe.glm53.glm53 import Glm53TextMoEConfig
 
 
 HIDDEN = 32
@@ -37,7 +39,7 @@ INDEX_KPOOL = 2
 INDEX_TOPK = 4
 
 
-def _xtuner_module():
+def _xtuner_module(**overrides):
     cfg = NoPEDSAMLAConfig(
         q_lora_rank=Q_LORA_RANK,
         kv_lora_rank=KV_LORA_RANK,
@@ -53,15 +55,17 @@ def _xtuner_module():
         sparse_mla_backend="torch",
         indexer_backend="torch",
         freeze_dsa_indexer=True,
+        **overrides,
     )
     return cfg.build(hidden_size=HIDDEN, layer_idx=0)
 
 
-def _hf_module():
+def _hf_config(rms_norm_eps=1e-6):
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
-    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
-    config = Glm5NextTextConfig(
+    return Glm5NextTextConfig(
+        eos_token_id=1,
+        pad_token_id=0,
         hidden_size=HIDDEN,
         q_lora_rank=Q_LORA_RANK,
         kv_lora_rank=KV_LORA_RANK,
@@ -77,10 +81,16 @@ def _hf_module():
         index_kpool_always_select_tail=True,
         indexer_types=["full"],
         attention_bias=False,
-        rms_norm_eps=1e-6,
+        rms_norm_eps=rms_norm_eps,
         attention_dropout=0.0,
         _attn_implementation="eager",
     )
+
+
+def _hf_module(rms_norm_eps=1e-6):
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
+
+    config = _hf_config(rms_norm_eps)
     return Glm5NextTextAttention(config, layer_idx=0), config
 
 
@@ -106,7 +116,8 @@ def _copy_weights(hf_module, xtuner_module) -> None:
 
 
 class TestNoPEDSAMultiLatentAttentionMatchesHF:
-    def test_projected_output_matches_hf_single_document(self):
+    @pytest.mark.parametrize("rms_norm_eps", [1e-6, 1e-5])
+    def test_projected_output_matches_hf_single_document(self, rms_norm_eps):
         # Attention math (absorb/unabsorb, SparseMLA) matches HF to ~1e-10 (near machine
         # precision) for most seeds -- confirmed by sweeping seeds 0-10, where the great
         # majority pass at that tightness. A minority (e.g. seed=0, seed=4, seed=8) hit a
@@ -116,11 +127,11 @@ class TestNoPEDSAMultiLatentAttentionMatchesHF:
         # the same index sets as HF at larger scale in test_glm53_dsa.py's
         # TestTorchKpoolMatchesHF). seed=1 is a known-clean draw for this tiny/tie-prone shape.
         torch.manual_seed(1)
-        hf_module, hf_config = _hf_module()
+        hf_module, hf_config = _hf_module(rms_norm_eps)
         with torch.no_grad():
             for p in hf_module.parameters():
                 p.normal_(mean=0.0, std=0.02)
-        xtuner_module = _xtuner_module()
+        xtuner_module = _xtuner_module(rms_norm_eps=rms_norm_eps)
         _copy_weights(hf_module, xtuner_module)
 
         seq_len = 11
@@ -298,13 +309,14 @@ class TestNoPEDSAMLAConfigRMSNormEps:
         indexer_backend="torch",
     )
 
-    def test_eps_reaches_q_and_kv_layernorms(self):
+    @pytest.mark.parametrize("rms_norm_eps", [1e-5, 3e-4])
+    def test_eps_reaches_q_and_kv_layernorms(self, rms_norm_eps):
         # 修复前：config 无 rms_norm_eps 字段（extra="forbid" 下直接 TypeError），
         # 两个 norm 恒为类默认 1e-6。
-        cfg = NoPEDSAMLAConfig(**self._BASE_KWARGS, rms_norm_eps=1e-5)
+        cfg = NoPEDSAMLAConfig(**self._BASE_KWARGS, rms_norm_eps=rms_norm_eps)
         attn = cfg.build(hidden_size=HIDDEN, layer_idx=0)
-        assert attn.q_a_layernorm.variance_epsilon == 1e-5
-        assert attn.kv_a_layernorm.variance_epsilon == 1e-5
+        assert attn.q_a_layernorm.variance_epsilon == rms_norm_eps
+        assert attn.kv_a_layernorm.variance_epsilon == rms_norm_eps
 
     def test_default_keeps_legacy_eps(self):
         # 不带 config 值直接构造时保持旧的 1e-6 行为，既有调用方不受影响。
@@ -312,15 +324,32 @@ class TestNoPEDSAMLAConfigRMSNormEps:
         assert attn.q_a_layernorm.variance_epsilon == 1e-6
         assert attn.kv_a_layernorm.variance_epsilon == 1e-6
 
+    @pytest.mark.parametrize("rms_norm_eps", [1e-6, 1e-5, 3e-4])
+    def test_from_hf_eps_reaches_both_norms(self, tmp_path, rms_norm_eps):
+        # Exercise the real config loader without checkpoint weights or a GPU.
+        # A third epsilon also rejects implementations hardcoding the checkpoint's 1e-5.
+        hf_config = _hf_config(rms_norm_eps)
+        # from_hf validates the production backend before we select the CPU backend.
+        hf_config.num_attention_heads = 64
+        hf_config.num_key_value_heads = 64
+        # These checkpoint fields are consumed by XT's text-config loader.
+        hf_config.first_k_dense_replace = 1
+        hf_config.scoring_func = "sigmoid"
+        hf_config.num_nextn_predict_layers = 0
+        hf_config.linear_attn_config = dict(num_heads=2, head_dim=16, short_conv_kernel_size=4, gate_lower_bound=-5.0)
+        hf_config.save_pretrained(tmp_path)
+        cfg = Glm53TextMoEConfig.from_hf(tmp_path)
+        cfg.attention.sparse_mla_backend = "torch"
+        cfg.attention.indexer_backend = "torch"
+        attn = cfg.attention.build(hidden_size=cfg.hidden_size, layer_idx=0)
+        assert attn.q_a_layernorm.variance_epsilon == rms_norm_eps
+        assert attn.kv_a_layernorm.variance_epsilon == rms_norm_eps
+
     def test_hf_builds_these_norms_from_the_same_config_eps(self):
-        # 语义来源交叉验证：HF 对这两个 norm 用 config.rms_norm_eps。注意现有 HF 对拍
-        # 用例（_hf_module）把 rms_norm_eps 硬编码为 1e-6，恰好等于旧默认值，因此对拍
-        # 从未覆盖该 eps 分歧 —— 真实 checkpoint 为 1e-5。
-        from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+        # HF constructs both norms from the text-config epsilon.
         from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
-        _, config = _hf_module()
-        config.rms_norm_eps = 1e-5
+        config = _hf_config(rms_norm_eps=1e-5)
         with torch.device("meta"):
             hf_attn = Glm5NextTextAttention(config, layer_idx=0)
         assert hf_attn.q_a_layernorm.variance_epsilon == 1e-5
