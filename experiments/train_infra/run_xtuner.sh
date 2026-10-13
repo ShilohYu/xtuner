@@ -8,8 +8,10 @@ fi
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-gpu_usage="$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits)"
-if ! awk -F, '$2 + 0 > 0 { print "GPU occupied: " $0; busy=1 } END { exit busy }' <<< "$gpu_usage"; then
+gpu_usage="$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits)"
+# 驱动本身可占几 MiB；只把实际计算进程视为占卡。
+if [[ -n "$gpu_usage" ]]; then
+  printf 'GPU occupied:\n%s\n' "$gpu_usage" >&2
   exit 75
 fi
 export PYTHONPATH="$repo_root"
