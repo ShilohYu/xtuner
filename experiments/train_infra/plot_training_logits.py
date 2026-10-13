@@ -32,6 +32,8 @@ def main():
     args = parser.parse_args()
     statuses = json.loads((args.out / "run_status.json").read_text())
     assert len(statuses) == 2 and all(s["optimizer_gate_passed"] for s in statuses), statuses
+    am_environment = json.loads((args.runs / "automodel_e2e" / "environment_rank0.json").read_text())
+    am_label = "AM + HF gated RMSNorm" if am_environment.get("hf_gated_norm_modules") else "native AM text"
     steps = {s["expected_steps"] for s in statuses}
     assert len(steps) == 1
     total = steps.pop()
@@ -77,7 +79,7 @@ def main():
     axes[1, 1].set(xlabel="Completed optimizer updates", ylabel="Error (%)", xticks=[0,total])
     for ax in axes.flat:
         ax.legend(fontsize=8)
-    fig.suptitle(f"Fixed 8K pack before/after {total} real training steps; native AM text / XT HF RMSNorm")
+    fig.suptitle(f"Fixed 8K pack before/after {total} real training steps; {am_label} / XT HF RMSNorm")
     fig.savefig(args.out / "logits_before_after_training.png", dpi=180)
     with (args.out / "fixed_pack_token_errors.csv").open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
@@ -108,7 +110,7 @@ def main():
     for panel in panels:
         panel.legend(fontsize=9)
         panel.grid(alpha=0.2)
-    overview.suptitle(f"{total} optimizer steps | GLM-5.3-Flash 4 layers, 8 GPUs, 8K | frozen ViT/projector, compile off")
+    overview.suptitle(f"{total} optimizer steps | GLM-5.3-Flash 4 layers, 8 GPUs, 8K | frozen ViT/projector, compile off\n{am_label} / XT HF RMSNorm")
     overview.savefig(args.out / "loss_logits_grad_norm.png", dpi=180)
     print(json.dumps(reports, indent=2))
 

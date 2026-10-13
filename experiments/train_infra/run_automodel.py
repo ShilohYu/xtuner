@@ -139,6 +139,12 @@ def main():
     if not native_text:
         shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(model.model.language_model)
         shared_text_kernels["bf16_clamped_mlp_modules"] = install_text_mlp(model.model.language_model)
+    gated_norm_fix = []
+    if os.environ.get("TRAIN_INFRA_AM_HF_GATED_NORM") == "1":
+        assert native_text, "The single-variable gated-norm experiment requires native AM text"
+        from experiments.train_infra.text_attention import install_automodel_hf_gated_norm
+        gated_norm_fix = install_automodel_hf_gated_norm(model.model.language_model)
+        assert len(gated_norm_fix) == 2, gated_norm_fix
     if cfg["model_cfg"].get("freeze_vision"):
         assert not any(p.requires_grad for p in model.model.visual.parameters())
     assert not any(p.is_meta for p in model.parameters())
@@ -196,6 +202,7 @@ def main():
                 "model_class": type(model).__name__, "auxiliary_loss": balance_cfg.model_dump(),
                 "master_dtype": "float32", "reduce_dtype": "bfloat16",
                 "shared_text_kernels": shared_text_kernels,
+                "hf_gated_norm_modules": gated_norm_fix,
                 "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"],
                 "legacy_flash_mla_zero_indexer_adapter": legacy_flash_mla,
                 "vision_attention": {"implementation": "flash_attention_2_varlen",

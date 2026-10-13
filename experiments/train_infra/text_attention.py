@@ -115,3 +115,24 @@ def install_shared_text_kernels(layers):
             "forget_gate": layers._fused_kda_gate.__module__ + "." + layers._fused_kda_gate.__name__,
             "conv1d": layers._fla_causal_conv1d.__module__ + "." + layers._fla_causal_conv1d.__name__,
             "gated_norm": rms_norm_gated.__module__ + "." + rms_norm_gated.__name__}
+
+
+def _hf_gated_rms_norm(self, hidden_states, gate):
+    import torch
+
+    states = hidden_states.float()
+    normalized = states * torch.rsqrt(states.square().mean(-1, keepdim=True) + self.variance_epsilon)
+    return (self.weight.float() * normalized * torch.sigmoid(gate.float())).to(hidden_states.dtype)
+
+
+def install_automodel_hf_gated_norm(text):
+    """Match HF GLM KDA precision without replacing parameters or other norms."""
+    from nemo_automodel.components.models.glm5_next.layers import _TorchRMSNormGated
+
+    names = []
+    for name, module in text.named_modules():
+        if isinstance(module, _TorchRMSNormGated):
+            module.forward = MethodType(_hf_gated_rms_norm, module)
+            names.append(name)
+    assert names, "No native AM KDA gated norms selected"
+    return names
