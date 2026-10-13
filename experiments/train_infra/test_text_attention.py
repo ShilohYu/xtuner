@@ -13,6 +13,31 @@ from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.module.attention.kda import KimiDeltaAttention
 
 
+def test_xtuner_hf_norm_adapter_matches_independent_hf_forward_and_backward():
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextRMSNorm
+    from xtuner.v1.module.rms_norm import RMSNorm
+    from experiments.train_infra.text_attention import install_xtuner_hf_rms_norm
+
+    torch.manual_seed(41)
+    xt = RMSNorm(64, eps=1e-5).bfloat16()
+    hf = Glm5NextTextRMSNorm(64, eps=1e-5).bfloat16()
+    with torch.no_grad():
+        xt.weight.uniform_(0.5, 1.5)
+        hf.weight.copy_(xt.weight)
+    parameter = xt.weight
+    assert install_xtuner_hf_rms_norm(xt) == 1
+    assert xt.weight is parameter
+    x = torch.randn(1, 37, 64, dtype=torch.bfloat16)
+    a, b = (x.clone().requires_grad_() for _ in range(2))
+    ya, yb = xt(a), hf(b)
+    torch.testing.assert_close(ya, yb, atol=0, rtol=0)
+    cotangent = torch.randn_like(ya)
+    ya.backward(cotangent)
+    yb.backward(cotangent)
+    torch.testing.assert_close(a.grad, b.grad, atol=0, rtol=0)
+    torch.testing.assert_close(xt.weight.grad, hf.weight.grad, atol=0, rtol=0)
+
+
 def test_text_mlp_adapter_preserves_other_instances_and_gradients():
     from nemo_automodel.components.moe.layers import MLP
     from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseMLP

@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--native-text", action="store_true", help="Keep native AutoModel text operators")
+    parser.add_argument("--xtuner-hf-norm", action="store_true", help="Test HF RMSNorm precision on XTuner only")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
@@ -56,6 +58,10 @@ def main():
         model.fully_shard(fsdp)
         model.from_hf("/tmp/GLM-5.3-Flash-4layer", strict=True)
         vision, projector, text = model.vision_tower, model.multi_modal_projector, model.language_model
+        xtuner_hf_norm_modules = 0
+        if args.xtuner_hf_norm:
+            from experiments.train_infra.text_attention import install_xtuner_hf_rms_norm
+            xtuner_hf_norm_modules = install_xtuner_hf_rms_norm(text)
         cu = batch["cu_seqlens"]
         maximum = int((cu[1:] - cu[:-1]).max())
         context = SequenceContext(
@@ -96,7 +102,7 @@ def main():
         register_glm_layers(parallelizer, Glm5NextForConditionalGeneration)
         register_flash_mla_compat(cudnn_sparse_attention)
         install_flash_attention_2(native_vision, flash_attn_varlen_func)
-        shared_text_kernels = install_shared_text_kernels(native_layers)
+        shared_text_kernels = {"mode": "native AutoModel"} if args.native_text else install_shared_text_kernels(native_layers)
         strategy = FSDP2Config(
             enable_compile=False, activation_checkpointing=True, defer_fsdp_grad_sync=False,
             reshard_after_forward=True,
@@ -121,8 +127,9 @@ def main():
         groups = parallelizer.get_model_layer_groups(model)
         assert len(groups["language"]) == 4 and len(groups["vision"]) == 24
         vision, projector, text = model.model.visual, None, model.model.language_model
-        shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(text)
-        shared_text_kernels["bf16_clamped_mlp_modules"] = install_text_mlp(text)
+        if not args.native_text:
+            shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(text)
+            shared_text_kernels["bf16_clamped_mlp_modules"] = install_text_mlp(text)
 
         def forward():
             return model(
@@ -243,6 +250,8 @@ def main():
                     "training": True, "freeze_vision_and_projector": True, "compile": False,
                     "cast_forward_inputs": False,
                     "shared_text_kernels": shared_text_kernels if args.backend == "automodel" else "native XTuner",
+                    "native_automodel_text": args.native_text,
+                    "xtuner_hf_norm_modules": xtuner_hf_norm_modules if args.backend == "xtuner" else 0,
                     "no_grad": True, "world": 8, "ep": 1, "sp": 1, "optimizer_steps": 0,
                     "observation_preserves_logits": True, "router_bias_unchanged": True,
                     "experiment_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),

@@ -8,6 +8,7 @@ shift
 diagnostic_out="$1"
 fixture="$2"
 reference="$3"
+shift 3
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 if [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]]; then
@@ -33,7 +34,7 @@ for backend in xtuner automodel; do
   set +e
   "$python_bin" -m torch.distributed.run --standalone --nproc_per_node=8 \
     -m experiments.train_infra.probe_forward --backend "$backend" --fixture "$fixture" \
-    --reference "$reference" --out "$diagnostic_out/$backend" > "$diagnostic_out/$backend.log" 2>&1
+    --reference "$reference" --out "$diagnostic_out/$backend" "$@" > "$diagnostic_out/$backend.log" 2>&1
   result=$?
   set -e
   printf '%s\n' "$result" > "$diagnostic_out/${backend}_exit_code.txt"

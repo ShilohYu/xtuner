@@ -94,3 +94,45 @@ mismatch without installing packages or substituting an AM recipe template.
 
 These results validate the automatic pytest entry point, not AM EP/CP or
 training/backward. Earlier distributed experiment artifacts remain separate.
+
+## Packed training diagnostic findings (2026-10-13)
+
+These findings use a real 8K XTuner pack and the four-layer checkpoint. They
+are separate from the earlier six-case eval test. Freeze vision/projector,
+disable compile, keep FP32 exception parameters, and verify input/weight hashes
+before comparing. Exclude padding from text error statistics.
+
+- **Vision:** FA2 varlen on both sides plus `cast_forward_inputs=False` preserves
+  FP32 visual RoPE. Visual stages/features then match bitwise. Text adapters must
+  affect language instances only: native text/vision share an RMSNorm class.
+- **Text RMSNorm:** XTuner's default BF16 `F.rms_norm` differs from HF's explicit
+  FP32 statistics/normalization, cast, then affine. On recorded layer-zero input,
+  relative L2 is 0.2804%; native AutoModel matches HF bitwise. A GLM-specific
+  HF-compatible XTuner path merits validation; replacing AM norm with XT norm
+  alone is not a correctness fix. An experiment-only XT norm adapter matches HF
+  forward and both input/weight gradients in the CPU regression.
+- **Dense MLP:** native AM clamped SwiGLU promotes gate/up to FP32; XTuner and HF
+  preserve BF16 and match bitwise on the real input. Sharing BF16 activation
+  explains/eliminates this difference, but is an AM experiment adaptation.
+- **mHC residual mix:** fused XT vs AM/HF matmul relative L2 is 0.1717% on identical
+  inputs. Against FP32 math, errors are 0.1852% XT and 0.2110% AM/HF; this does not
+  establish an XT formula bug. Exact matching needs consistent rounding/order.
+- **DSA projections:** whole-pack XT vs document/32-token AM `q_a` GEMM differs
+  by 0.0130% relative L2. Errors against FP32 GEMM are nearly equal (0.165927%
+  and 0.165927%); shape-dependent rounding alone does not justify an XT rewrite.
+- **DSA key selection:** original native selection differs on 2.38% of real
+  token rows. Forcing identical key sets leaves output relative L2 0.2057%; key
+  selection alone is not the full explanation. KPool scoring/tie precision
+  remains under investigation.
+- **Sparse attention:** with identical Q/KV/key sets, XT vs AM output relative
+  L2 is 0.0247%. Sorting XT indices to AM's order makes outputs bitwise equal;
+  five sampled rows have nearly identical error against FP32 softmax (0.1662%).
+  No attention-formula bug is established. Reusing all XT DSA logic is only a
+  counterfactual experiment, not an independent correctness reference; the
+  proposed DSA adapter was withdrawn and not committed.
+- **Acceptance:** the shared-text experiment at `20a736a65` aligns layer zero
+  bitwise, but supervised logits still differ by 6.85% relative L2 / 5.55% top-1.
+  It is not a native-text parity result. Backward/full training remains unverified.
+  Grad norm records are pre-clipping global L2; a complete training run requires
+  every rank to have all expected continuous steps. Historical AM has 6/20
+  updates (stopped), XT 20/20; they are not curves for the latest fixes.

@@ -5,6 +5,27 @@ from types import MethodType
 import torch.nn.functional as F
 
 
+def _hf_rms_norm(self, hidden_states):
+    import torch
+
+    weight = self.weight.to_local() if hasattr(self.weight, "to_local") else self.weight
+    states = hidden_states.float()
+    normalized = states * torch.rsqrt(states.square().mean(-1, keepdim=True) + self.variance_epsilon)
+    return weight * normalized.to(hidden_states.dtype)
+
+
+def install_xtuner_hf_rms_norm(text):
+    from xtuner.v1.module.rms_norm import RMSNorm
+
+    count = 0
+    for module in text.modules():
+        if isinstance(module, RMSNorm) and module._type == "default":
+            module.forward = MethodType(_hf_rms_norm, module)
+            count += 1
+    assert count, "No XTuner text RMSNorm modules selected"
+    return count
+
+
 def _text_rms_norm(self, hidden_states):
     from xtuner.v1.ops import rms_norm
 
