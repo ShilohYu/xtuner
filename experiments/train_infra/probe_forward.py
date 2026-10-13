@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import torch
@@ -130,6 +131,24 @@ def main():
         projector.requires_grad_(False)
     assert vision.rotary_pos_emb.inv_freq.dtype == torch.float32
     assert not any(p.is_meta for p in model.parameters())
+    visual_parameters = {}
+    for module in ((vision, projector) if projector is not None else (vision,)):
+        for name, param in module.named_parameters():
+            clean = name.replace("_checkpoint_wrapped_module.", "").replace("_orig_mod.", "")
+            keys = module.to_hf_key_list(clean) if args.backend == "xtuner" else ["model.visual." + clean]
+            assert len(keys) == 1
+            full = param.full_tensor() if hasattr(param, "full_tensor") else param
+            if rank == 0:
+                visual_parameters[keys[0]] = {"dtype": str(full.dtype), "shape": list(full.shape), "sha256": tensor_hash(full)}
+            del full
+    if rank == 0:
+        assert len(visual_parameters) == 347
+        (args.out / "visual_load_audit.json").write_text(json.dumps({
+            "parameters": visual_parameters,
+            "inv_freq": vision.rotary_pos_emb.inv_freq.detach().cpu().tolist(),
+            "inv_freq_dtype": str(vision.rotary_pos_emb.inv_freq.dtype),
+            "head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        }, indent=2))
     biases = {n: tensor_hash(v) for n, v in model.named_buffers() if n.endswith("e_score_correction_bias")}
     # The unobserved pass checks that capturing intermediate tensors does not alter the forward.
     print(f"STAGE rank={rank} unobserved_forward", flush=True)
@@ -150,6 +169,12 @@ def main():
     handles.append(text.norm.register_forward_hook(hook("final_norm")))
     feature_module = projector if projector is not None else vision.merger
     handles.append(feature_module.register_forward_hook(hook("visual_features")))
+    for module in ((vision, projector) if projector is not None else (vision,)):
+        for name, child in module.named_modules():
+            if name in ("patch_embed", "post_layernorm", "downsample", "merger") or (
+                name.startswith("blocks.") and name.count(".") == 1
+            ):
+                handles.append(child.register_forward_hook(hook("vision." + name)))
     for i, layer in enumerate(text.layers.values()):
         handles.append(layer.register_forward_hook(hook(f"layer{i}", "hidden_states" if args.backend == "xtuner" else None)))
         if i == 0:
@@ -177,6 +202,7 @@ def main():
                     "training": True, "freeze_vision_and_projector": True, "compile": False,
                     "no_grad": True, "world": 8, "ep": 1, "sp": 1, "optimizer_steps": 0,
                     "observation_preserves_logits": True, "router_bias_unchanged": True,
+                    "experiment_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                     "diagnostic": "Common rank0 step0 full 8K pack repeated on all ranks; no training acceptance"}
         (args.out / "metadata.json").write_text(json.dumps(metadata, indent=2))
         print(json.dumps({"out": str(args.out), "logits": list(logits.shape)}), flush=True)
