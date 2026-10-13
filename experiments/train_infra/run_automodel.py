@@ -267,8 +267,8 @@ def main():
         with (args.out / f"metrics_rank{rank}.jsonl").open("a") as stream:
             stream.write(json.dumps(row) + "\n")
         del batches, batch, output, context
-    if os.environ.get("TRAIN_INFRA_LOGITS_FIXTURE"):
-        capture_logits(model, "automodel", args.out, len(replay.entries))
+        if os.environ.get("TRAIN_INFRA_LOGITS_FIXTURE"):
+            capture_logits(model, "automodel", args.out, entry["step"] + 1)
     dist.destroy_process_group()
 
 

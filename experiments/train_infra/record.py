@@ -136,7 +136,7 @@ def install():
         with (out / f"metrics_rank{dist.get_rank()}.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
         self._experiment_step += 1
-        if self._experiment_step == int(os.environ.get("TRAIN_INFRA_STEPS") or -1) and os.environ.get("TRAIN_INFRA_LOGITS_FIXTURE"):
+        if os.environ.get("TRAIN_INFRA_LOGITS_FIXTURE"):
             from experiments.train_infra.training_logits import capture_logits
             capture_logits(self.model, "xtuner", out, self._experiment_step)
         return result

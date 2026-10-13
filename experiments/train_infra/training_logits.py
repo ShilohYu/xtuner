@@ -1,4 +1,4 @@
-"""Fixed-input logits before/after training; observation preserves RNG and router state."""
+"""Fixed-input logits at every update; observation preserves RNG and router state."""
 
 import json
 import os
