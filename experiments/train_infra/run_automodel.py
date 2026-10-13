@@ -20,6 +20,7 @@ def register_glm_layers(parallelizer, model_class):
         specs = native_layer_specs()
         glm_groups = {"language": ["model.language_model.layers"], "vision": ["model.visual.blocks"]}
         specs[model_class] = glm_groups
+        specs[model_class.__name__] = glm_groups
         specs[f"FSDP{model_class.__name__}"] = glm_groups
         return specs
 
@@ -98,6 +99,12 @@ def main():
     assert not any(p.is_meta for p in model.parameters())
     groups = parallelizer.get_model_layer_groups(model)
     assert len(groups.get("language", [])) == 4 and len(groups.get("vision", [])) == 24, groups
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+    checkpoint_counts = {name: sum(isinstance(module, CheckpointWrapper) for layer in layers
+                                   for module in layer.modules()) for name, layers in groups.items()}
+    assert checkpoint_counts.get("language", 0) >= 8, checkpoint_counts
+    assert checkpoint_counts.get("vision", 0) >= 48, checkpoint_counts
     parameters = [p for p in model.parameters() if p.requires_grad]
     assert all(p.dtype == torch.float32 for p in parameters), "FP32 master weights required"
     optimizer = torch.optim.AdamW(parameters, lr=2e-5, betas=(0.9, 0.95), eps=1e-8,
@@ -132,15 +139,19 @@ def main():
             capture["context"].accumulate(router_weights=scores)
             capture["loads"].append(torch.bincount(indices.reshape(-1), minlength=scores.shape[-1]))
 
+    gates = []
     for name, module in model.named_modules():
-        if name.endswith(".mlp.gate"):
+        if name.endswith(".gate") and hasattr(module, "e_score_correction_bias"):
             module.register_forward_hook(gate_hook, with_kwargs=True)
+            gates.append(name)
+    assert len(gates) == 3, gates
     manifest = {"reference": str(args.reference), "backend": asdict(backend),
                 "strategy": asdict(strategy), "torch": torch.__version__,
                 "model_class": type(model).__name__, "auxiliary_loss": balance_cfg.model_dump(),
                 "master_dtype": "float32", "reduce_dtype": "bfloat16",
                 "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"],
-                "layer_groups": {name: len(layers) for name, layers in groups.items()}}
+                "layer_groups": {name: len(layers) for name, layers in groups.items()},
+                "checkpoint_wrappers": checkpoint_counts, "auxiliary_gates": gates}
     (args.out / f"environment_rank{rank}.json").write_text(json.dumps(manifest, default=str, indent=2))
     for entry in replay.entries:
         torch.cuda.reset_peak_memory_stats()

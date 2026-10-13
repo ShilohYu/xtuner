@@ -26,6 +26,10 @@ class LayerGroupsTest(unittest.TestCase):
             register_glm_layers(parallelizer, Glm5NextForConditionalGeneration)
             groups = parallelizer.get_model_layer_groups(model)
             self.assertEqual({key: len(value) for key, value in groups.items()}, {"language": 4, "vision": 24})
+            # AutoModel's checkpoint mixin constructs a distinct class with the same name.
+            model.__class__ = type("Glm5NextForConditionalGeneration", (Glm5NextForConditionalGeneration,), {})
+            mixed = parallelizer.get_model_layer_groups(model)
+            self.assertEqual({key: len(value) for key, value in mixed.items()}, {"language": 4, "vision": 24})
             model.__class__ = type("FSDPGlm5NextForConditionalGeneration", (Glm5NextForConditionalGeneration,), {})
             wrapped = parallelizer.get_model_layer_groups(model)
             self.assertEqual({key: len(value) for key, value in wrapped.items()}, {"language": 4, "vision": 24})
