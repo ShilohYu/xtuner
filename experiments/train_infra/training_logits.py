@@ -63,4 +63,3 @@ def capture_logits(model, backend, out, completed_updates):
         for module, before in loads:
             module._cumulative_expert_load = before
     dist.barrier()
-
