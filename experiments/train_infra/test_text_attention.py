@@ -8,9 +8,33 @@ from torch.nn.attention.flex_attention import BlockMask
 microbatch.BlockMask = BlockMask
 from nemo_automodel.components.models.glm5_next import layers
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
-from experiments.train_infra.text_attention import install_shared_text_kernels
+from experiments.train_infra.text_attention import install_shared_text_kernels, install_text_rms_norm
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.module.attention.kda import KimiDeltaAttention
+
+
+def test_text_norm_adapter_preserves_native_vision(monkeypatch):
+    from nemo_automodel.components.models.glm5_next import vision
+    from xtuner.v1.ops import rms_norm
+
+    for cls in (layers.Glm5NextRMSNorm, layers.Glm5NextUnweightedRMSNorm, layers._TorchRMSNormGated):
+        monkeypatch.setattr(cls, "forward", cls.forward)
+    for name in ("_chunk_kda", "_fused_kda_gate", "_fla_causal_conv1d"):
+        monkeypatch.setattr(layers, name, getattr(layers, name))
+    torch.manual_seed(23)
+    visual = vision.Glm5NextRMSNorm(32, 1e-5, torch.bfloat16)
+    text = layers.Glm5NextRMSNorm(32, 1e-5, torch.bfloat16)
+    inputs = torch.randn(2, 37, 32, dtype=torch.bfloat16)
+    with torch.no_grad():
+        visual.weight.uniform_(0.5, 1.5)
+        text.weight.copy_(visual.weight)
+        baseline = visual(inputs)
+        native_forward = layers.Glm5NextRMSNorm.forward
+        install_shared_text_kernels(layers)
+        assert install_text_rms_norm(torch.nn.ModuleList([text])) == 1
+        assert layers.Glm5NextRMSNorm.forward is native_forward
+        torch.testing.assert_close(visual(inputs), baseline, atol=0, rtol=0)
+        torch.testing.assert_close(text(inputs), rms_norm(inputs, text.weight, 1e-5), atol=0, rtol=0)
 
 
 @pytest.mark.gpu

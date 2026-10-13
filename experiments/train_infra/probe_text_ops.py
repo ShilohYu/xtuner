@@ -70,6 +70,9 @@ def main():
         compare("hc_collapsed", xt_collapsed, am_collapsed)
         norms = [RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps).cuda().bfloat16(),
                  Glm5NextRMSNorm(cfg.hidden_size, cfg.rms_norm_eps, torch.bfloat16).cuda()]
+        if args.shared_text_kernels:
+            from experiments.train_infra.text_attention import install_text_rms_norm
+            install_text_rms_norm(norms[1])
         for norm in norms:
             norm.weight.copy_(weight("input_layernorm.weight"))
         x, y = norms[0](xt_collapsed), norms[1](am_collapsed)

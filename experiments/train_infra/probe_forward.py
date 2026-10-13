@@ -84,7 +84,7 @@ def main():
         from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
         from experiments.train_infra.run_automodel import register_glm_layers, register_flash_mla_compat
         from experiments.train_infra.vision_attention import install_flash_attention_2
-        from experiments.train_infra.text_attention import install_shared_text_kernels
+        from experiments.train_infra.text_attention import install_shared_text_kernels, install_text_rms_norm
 
         native_checkpoint = activation_checkpointing.checkpoint_wrapper
 
@@ -121,6 +121,7 @@ def main():
         groups = parallelizer.get_model_layer_groups(model)
         assert len(groups["language"]) == 4 and len(groups["vision"]) == 24
         vision, projector, text = model.model.visual, None, model.model.language_model
+        shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(text)
 
         def forward():
             return model(

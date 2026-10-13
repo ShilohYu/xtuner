@@ -85,7 +85,7 @@ def main():
     from nemo_automodel.components.models.glm5_next import layers
     from flash_attn import flash_attn_varlen_func
     from experiments.train_infra.vision_attention import install_flash_attention_2
-    from experiments.train_infra.text_attention import install_shared_text_kernels
+    from experiments.train_infra.text_attention import install_shared_text_kernels, install_text_rms_norm
     from nemo_automodel.components.training.utils import (
         prepare_for_final_backward, prepare_for_grad_accumulation, scale_grads_and_clip_grad_norm,
     )
@@ -132,6 +132,7 @@ def main():
         text_config={"num_nextn_predict_layers": 0, "output_hidden_states": False},
     ).train()
     assert isinstance(model, Glm5NextForConditionalGeneration), type(model)
+    shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(model.model.language_model)
     assert not any(p.is_meta for p in model.parameters())
     groups = parallelizer.get_model_layer_groups(model)
     assert len(groups.get("language", [])) == 4 and len(groups.get("vision", [])) == 24, groups
