@@ -34,12 +34,36 @@ def main():
                   "finite_metrics": finite if min(counts) else None,
                   "nonzero_updates_all_ranks": updated,
                   "optimizer_gate_passed": exit_code == 0 and counts == [20] * 8 and finite and updated}
+        environment = run / "environment_rank0.json"
+        native = json.loads(environment.read_text()) if environment.is_file() else {}
         config = run / "resolved_config.json"
+        reference = Path(native["reference"]) if "reference" in native else None
+        if reference is not None:
+            status["reference_run"] = reference.name
+            status["layer_groups"] = native.get("layer_groups")
+            config = reference / "resolved_config.json"
+        valid = not (run / "CONFIGURATION_ABORTED.txt").exists()
+        if run.name.startswith("automodel_"):
+            valid = valid and native.get("layer_groups") == {"language": 4, "vision": 24}
+        status["configuration_validated"] = valid
+        status["optimizer_gate_passed"] &= valid
         if config.is_file():
             cfg = json.loads(config.read_text())
             status.update(pack_length=cfg["dataloader_cfg"]["pack_max_length"], sp_size=cfg["sp_size"],
                           ep_size=cfg["fsdp_cfg"]["ep_size"], compile=cfg["fsdp_cfg"]["torch_compile"])
-            status["reference_configuration"] = status["pack_length"] == 65536 and status["sp_size"] == 1
+            status["reference_configuration"] = (status["pack_length"] == 65536 and
+                                                 status["sp_size"] == 1 and status["ep_size"] == 1 and
+                                                 status["compile"] and valid)
+        if reference is not None and rank_rows[0]:
+            reference_metrics = reference / "metrics_rank0.jsonl"
+            baseline = {row["step"]: row for row in map(json.loads, reference_metrics.read_text().splitlines())} \
+                if reference_metrics.is_file() else {}
+            differences = [{"step": row["step"], **{
+                f"{key}_abs_error": abs(row[key] - baseline[row["step"]][key])
+                for key in ("loss", "grad_norm", "lr")}}
+                for row in rank_rows[0] if row["step"] in baseline]
+            status["observed_differences"] = differences
+            status["numerical_acceptance"] = "Not calibrated; observed errors do not establish parity"
         statuses.append(status)
     columns = ["run", "rank", "step", "loss", "ce_loss", "balancing_loss", "grad_norm", "lr",
                "probe", "update_max_abs", "peak_memory_bytes"]
