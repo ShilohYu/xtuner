@@ -45,6 +45,9 @@ def main():
         valid = not (run / "CONFIGURATION_ABORTED.txt").exists()
         if run.name.startswith("automodel_"):
             valid = valid and native.get("layer_groups") == {"language": 4, "vision": 24}
+            status["vision_attention_aligned"] = native.get("vision_attention", {}).get("implementation") == "flash_attention_2_varlen"
+            valid = valid and status["vision_attention_aligned"]
+        status["diagnostic_stopped"] = (run / "DIAGNOSTIC_STOPPED.txt").exists()
         status["configuration_validated"] = valid
         status["optimizer_gate_passed"] &= valid
         if config.is_file():
@@ -83,8 +86,11 @@ def main():
             rows = sorted((row for row in metrics if row["run"] == status["run"] and row["rank"] == 0),
                           key=lambda row: row["step"])
             if rows:
+                label = status["run"]
+                if status.get("vision_attention_aligned") is False:
+                    label += " (old ViT SDPA baseline)"
                 for axis, key in zip(axes, ("loss", "grad_norm")):
-                    axis.plot([row["step"] for row in rows], [row[key] for row in rows], label=status["run"])
+                    axis.plot([row["step"] for row in rows], [row[key] for row in rows], label=label)
                     axis.set(xlabel="Optimizer step (zero based)", ylabel=key)
                     axis.legend(fontsize=6)
         figure.savefig(args.out / "loss_grad_norm.png", dpi=180)

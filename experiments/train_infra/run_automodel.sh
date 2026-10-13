@@ -21,7 +21,7 @@ export WORK_DIR="${WORK_DIR:-/mnt/shared-storage-user/yushan/GLM-5.3-flash-integ
 mkdir -p "$(dirname -- "$WORK_DIR")"
 mkdir "$WORK_DIR"
 export TRITON_CACHE_DIR="$WORK_DIR/triton_cache" TORCHINDUCTOR_CACHE_DIR="$WORK_DIR/inductor_cache"
-cp experiments/train_infra/run_automodel.py experiments/train_infra/replay.py experiments/train_infra/run_automodel.sh "$WORK_DIR/"
+cp experiments/train_infra/run_automodel.py experiments/train_infra/replay.py experiments/train_infra/vision_attention.py experiments/train_infra/run_automodel.sh "$WORK_DIR/"
 git rev-parse HEAD > "$WORK_DIR/experiment_sha.txt"
 git -C /mnt/shared-storage-user/yushan/GLM-5.3-flash-integration/automodel rev-parse HEAD > "$WORK_DIR/automodel_sha.txt"
 git status --porcelain=v1 > "$WORK_DIR/git_status.txt"

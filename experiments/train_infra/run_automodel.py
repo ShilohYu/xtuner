@@ -2,6 +2,7 @@
 
 import argparse
 import inspect
+import importlib.metadata
 import json
 import os
 from dataclasses import asdict
@@ -72,6 +73,9 @@ def main():
     from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.common import cudnn_sparse_attention
     from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
+    from nemo_automodel.components.models.glm5_next import vision
+    from flash_attn import flash_attn_varlen_func
+    from experiments.train_infra.vision_attention import install_flash_attention_2
     from nemo_automodel.components.training.utils import (
         prepare_for_final_backward, prepare_for_grad_accumulation, scale_grads_and_clip_grad_norm,
     )
@@ -89,6 +93,9 @@ def main():
     parallelizer.checkpoint_wrapper = matching_checkpoint_wrapper
     register_glm_layers(parallelizer, Glm5NextForConditionalGeneration)
     legacy_flash_mla = register_flash_mla_compat(cudnn_sparse_attention)
+    assert os.environ.get("XTUNER_USE_FA3", "0") == "0", "Reference ViT uses FlashAttention 2"
+    assert os.environ.get("XTUNER_DETERMINISTIC", "false") != "true"
+    install_flash_attention_2(vision, flash_attn_varlen_func)
 
     strategy = FSDP2Config(
         enable_compile=cfg["fsdp_cfg"]["torch_compile"], activation_checkpointing=True,
@@ -168,6 +175,10 @@ def main():
                 "master_dtype": "float32", "reduce_dtype": "bfloat16",
                 "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"],
                 "legacy_flash_mla_zero_indexer_adapter": legacy_flash_mla,
+                "vision_attention": {"implementation": "flash_attention_2_varlen",
+                                     "version": importlib.metadata.version("flash-attn"),
+                                     "causal": False, "deterministic": False,
+                                     "dropout": model.config.vision_config.attention_dropout},
                 "layer_groups": {name: len(layers) for name, layers in groups.items()},
                 "checkpoint_wrappers": checkpoint_counts, "auxiliary_gates": gates}
     (args.out / f"environment_rank{rank}.json").write_text(json.dumps(manifest, default=str, indent=2))
