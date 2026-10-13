@@ -66,6 +66,29 @@ def main():
     with (args.out / "fixed_pack_token_errors.csv").open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     (args.out / "logits_comparison.json").write_text(json.dumps(reports, indent=2))
+    # One overview lets training curves and fixed-input forward differences be read together.
+    overview, panels = plt.subplots(1, 3, figsize=(18, 5), layout="constrained")
+    metrics = list(csv.DictReader((args.out / "optimizer_metrics.csv").open()))
+    for name, label in (("xtuner_e2e", "XTuner"), ("automodel_e2e", "AutoModel")):
+        trace = [r for r in metrics if r["run"] == name and r["rank"] == "0"]
+        assert [int(r["step"]) for r in trace] == list(range(total))
+        for panel, key in ((panels[0], "loss"), (panels[2], "grad_norm")):
+            panel.plot([int(r["step"]) for r in trace], [float(r[key]) for r in trace],
+                       marker="o", markersize=3, label=f"{label} ({total}/{total} steps)")
+    for updates in (0, total):
+        token_rows = [r for r in rows if r["completed_updates"] == updates]
+        panels[1].plot([r["position"] for r in token_rows], [r["relative_l2"]*100 for r in token_rows],
+                       alpha=0.8, label=f"{updates} completed updates")
+    panels[0].set(title="Loss", xlabel="Optimizer step (zero based)", ylabel="Loss")
+    panels[1].set(title="Logits: same fixed pack / full vocabulary", xlabel="Supervised token position",
+                  ylabel="Relative L2 error (%)")
+    panels[2].set(title="Grad norm before clipping", xlabel="Optimizer step (zero based)",
+                  ylabel="Global L2 norm")
+    for panel in panels:
+        panel.legend(fontsize=9)
+        panel.grid(alpha=0.2)
+    overview.suptitle(f"{total} optimizer steps | GLM-5.3-Flash 4 layers, 8 GPUs, 8K | frozen ViT/projector, compile off")
+    overview.savefig(args.out / "loss_logits_grad_norm.png", dpi=180)
     print(json.dumps(reports, indent=2))
 
 
