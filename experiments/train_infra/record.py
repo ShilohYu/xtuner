@@ -77,8 +77,26 @@ def install():
 
     def train_record(self, batches):
         self._experiment_step = getattr(self, "_experiment_step", 0)
+        diagnose = os.environ.get("TRAIN_INFRA_MEMORY_SNAPSHOT") == "1"
+        if diagnose and self._experiment_step == 0:
+            torch.cuda.memory._record_memory_history(max_entries=100000)
+        def forward_losses(module, inputs, output):
+            values = {name: float(getattr(output, name).detach()) for name in output.model_fields
+                      if "loss" in name and isinstance(getattr(output, name), torch.Tensor)}
+            with (out / f"forward_losses_rank{dist.get_rank()}.jsonl").open("a") as stream:
+                stream.write(json.dumps({"step": self._experiment_step, "losses": values,
+                                         "allocated_bytes": torch.cuda.memory_allocated()}) + "\n")
+        handle = self.model.register_forward_hook(forward_losses)
         print(f"STAGE rank={dist.get_rank()} step={self._experiment_step} forward_backward", flush=True)
-        result = train(self, batches)
+        try:
+            result = train(self, batches)
+        except torch.OutOfMemoryError:
+            (out / f"memory_summary_rank{dist.get_rank()}.txt").write_text(torch.cuda.memory_summary())
+            if diagnose:
+                torch.cuda.memory._dump_snapshot(str(out / f"memory_snapshot_rank{dist.get_rank()}.pickle"))
+            raise
+        finally:
+            handle.remove()
         loss = torch.tensor(result["total_loss"], device="cuda", dtype=torch.float64)
         dist.all_reduce(loss)
         # Native CE and balancing loss already report the global value on every rank.

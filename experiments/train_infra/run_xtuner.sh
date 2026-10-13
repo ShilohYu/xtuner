@@ -39,7 +39,7 @@ out = Path(os.environ['WORK_DIR'])
 (out / 'resolved_config.json').write_text(cfg.model_dump_json(indent=2, serialize_as_any=True))
 keys = ['CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_MAX_CONNECTIONS', 'NCCL_DEBUG',
         'XTUNER_TORCH_COMPILE', 'TRAIN_INFRA_LENGTH', 'TRAIN_INFRA_SP',
-        'TRAIN_INFRA_STEPS', 'TRAIN_INFRA_COMPILE', 'TRAIN_INFRA_DATA', 'PYTHONPATH']
+        'TRAIN_INFRA_STEPS', 'TRAIN_INFRA_COMPILE', 'TRAIN_INFRA_DATA', 'TRAIN_INFRA_MEMORY_SNAPSHOT', 'PYTHONPATH']
 manifest = {'python': platform.python_version(), 'torch': torch.__version__, 'cuda': torch.version.cuda,
             'transformers': transformers.__version__, 'xtuner_file': xtuner.__file__,
             'env': {k: os.environ.get(k, '<unset>') for k in keys}, 'cuda_devices': torch.cuda.device_count()}

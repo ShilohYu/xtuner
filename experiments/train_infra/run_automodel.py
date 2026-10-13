@@ -172,6 +172,9 @@ def main():
             aux = context.finalize(tokens_per_expert_local=loads, tokens_per_expert_global=global_loads,
                                    n_routed_experts=288, num_experts_per_tok=8,
                                    non_pad_token=int((~batch["padding_mask"]).sum()))
+            with (args.out / f"forward_losses_rank{rank}.jsonl").open("a") as stream:
+                stream.write(json.dumps({"step": entry["step"], "microbatch": index,
+                                         "ce_local": float(value.detach()), "balancing_global": float(aux.detach())}) + "\n")
             print(f"STAGE rank={rank} step={entry['step']} backward", flush=True)
             (value * dist.get_world_size() + aux).backward()
             local_ce += value.detach()
