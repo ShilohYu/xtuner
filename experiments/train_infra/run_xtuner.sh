@@ -24,7 +24,7 @@ export WORK_DIR="${WORK_DIR:-/mnt/shared-storage-user/yushan/GLM-5.3-flash-integ
 mkdir -p "$(dirname -- "$WORK_DIR")"
 mkdir "$WORK_DIR"
 export TRITON_CACHE_DIR="$WORK_DIR/triton_cache" TORCHINDUCTOR_CACHE_DIR="$WORK_DIR/inductor_cache"
-cp experiments/train_infra/config.py experiments/train_infra/run_xtuner.sh "$WORK_DIR/"
+cp experiments/train_infra/config.py experiments/train_infra/run_xtuner.sh experiments/train_infra/record.py "$WORK_DIR/"
 git rev-parse HEAD > "$WORK_DIR/code_sha.txt"
 git status --porcelain=v1 > "$WORK_DIR/git_status.txt"
 git diff HEAD --binary > "$WORK_DIR/code.patch"
@@ -59,7 +59,7 @@ monitor_pid=$!
 trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
 set +e
 python -m torch.distributed.run --standalone --nproc_per_node=8 \
-  xtuner/v1/train/cli/sft.py --config experiments/train_infra/config.py \
+  -m experiments.train_infra.record --config experiments/train_infra/config.py \
   2>&1 | tee "$WORK_DIR/training.log"
 train_exit=${PIPESTATUS[0]}
 set -e
