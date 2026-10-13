@@ -29,6 +29,14 @@ def register_glm_layers(parallelizer, model_class):
     # The checkout's generic heuristic selects only the 24-layer vision tower.
     parallelizer._get_model_layer_group_specs = matching_layer_specs
 
+    class GlmPrecisionStrategy(parallelizer.DefaultParallelizationStrategy):
+        # EP1's generic path otherwise casts the native FP32 holders to BF16.
+        _fp32_compute_module_names = tuple(model_class._keep_in_fp32_modules_strict)
+        _apply_fsdp_sharding = parallelizer.Qwen3_5ParallelizationStrategy._apply_fsdp_sharding
+
+    for name in (model_class.__name__, f"FSDP{model_class.__name__}"):
+        parallelizer.PARALLELIZATION_STRATEGIES[name] = GlmPrecisionStrategy()
+
 
 def register_flash_mla_compat(sparse_attention):
     native = sparse_attention._FLASH_MLA_SPARSE_FWD
