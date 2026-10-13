@@ -15,10 +15,11 @@ import matplotlib.pyplot as plt
 
 
 def errors(x, y):
-    assert x.shape == y.shape and x.dtype == y.dtype
+    assert x.shape == y.shape, (x.shape, y.shape)
     xf, yf = x.float(), y.float()
     diff = yf - xf
-    return {"shape": list(x.shape), "bitwise_equal": torch.equal(x, y),
+    return {"shape": list(x.shape), "xtuner_dtype": str(x.dtype), "automodel_dtype": str(y.dtype),
+            "bitwise_equal": x.dtype == y.dtype and torch.equal(x, y), "values_equal": torch.equal(xf, yf),
             "max_abs": diff.abs().max().item(),
             "relative_l2": (diff.norm() / xf.norm().clamp_min(1e-30)).item(),
             "unequal_fraction": (x != y).float().mean().item()}
