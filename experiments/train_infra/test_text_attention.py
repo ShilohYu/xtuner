@@ -13,6 +13,35 @@ from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.module.attention.kda import KimiDeltaAttention
 
 
+def test_text_mlp_adapter_preserves_other_instances_and_gradients():
+    from nemo_automodel.components.moe.layers import MLP
+    from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseMLP
+    from experiments.train_infra.text_attention import install_text_mlp
+
+    torch.manual_seed(31)
+    native = MLP(32, 64, "torch", dtype=torch.bfloat16, swiglu_limit=10)
+    other = MLP(32, 64, "torch", dtype=torch.bfloat16, swiglu_limit=10)
+    xt = DenseMLP(hidden_size=32, intermediate_size=64, hidden_act="silu", swiglu_limit=10).bfloat16()
+    xt.load_state_dict(native.state_dict())
+    other.load_state_dict(native.state_dict())
+    x = torch.randn(2, 37, 32, dtype=torch.bfloat16)
+    baseline = other(x)
+    assert not torch.equal(baseline, xt(x)), "Fixture must expose native FP32 activation rounding"
+    parameter_ids = {n: id(p) for n, p in native.named_parameters()}
+    assert install_text_mlp(native) == 1
+    assert parameter_ids == {n: id(p) for n, p in native.named_parameters()}
+    torch.testing.assert_close(other(x), baseline, atol=0, rtol=0)
+    a, b = (x.clone().requires_grad_() for _ in range(2))
+    ya, yb = xt(a), native(b)
+    torch.testing.assert_close(ya, yb, atol=0, rtol=0)
+    cotangent = torch.randn_like(ya)
+    ya.backward(cotangent)
+    yb.backward(cotangent)
+    torch.testing.assert_close(a.grad, b.grad, atol=0, rtol=0)
+    for name, p in xt.named_parameters():
+        torch.testing.assert_close(p.grad, dict(native.named_parameters())[name].grad, atol=0, rtol=0)
+
+
 def test_text_norm_adapter_preserves_native_vision(monkeypatch):
     from nemo_automodel.components.models.glm5_next import vision
     from xtuner.v1.ops import rms_norm

@@ -24,6 +24,26 @@ def install_text_rms_norm(text):
     return count
 
 
+def _text_mlp(self, x):
+    from xtuner.v1.ops.act_fn import get_gated_act_fn
+
+    activation = get_gated_act_fn("silu", self.swiglu_limit)
+    return self.down_proj(activation(self.gate_proj(x), self.up_proj(x)))
+
+
+def install_text_mlp(text):
+    from nemo_automodel.components.moe.layers import MLP
+
+    count = 0
+    for module in text.modules():
+        if isinstance(module, MLP) and module.activation == "swiglu" and module.swiglu_limit > 0:
+            # Scope to text dense/shared experts; leave vision and routed expert kernels intact.
+            module.forward = MethodType(_text_mlp, module)
+            count += 1
+    assert count, "No native clamped text MLP modules selected"
+    return count
+
+
 def _decoder_with_shared_hc_post(self, hidden_streams, *, packed_context, padding_mask=None, **kwargs):
     from xtuner.v1.module.decoder_layer.mhc import hc_post
 

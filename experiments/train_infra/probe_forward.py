@@ -84,7 +84,7 @@ def main():
         from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
         from experiments.train_infra.run_automodel import register_glm_layers, register_flash_mla_compat
         from experiments.train_infra.vision_attention import install_flash_attention_2
-        from experiments.train_infra.text_attention import install_shared_text_kernels, install_text_rms_norm
+        from experiments.train_infra.text_attention import install_shared_text_kernels, install_text_rms_norm, install_text_mlp
 
         native_checkpoint = activation_checkpointing.checkpoint_wrapper
 
@@ -122,6 +122,7 @@ def main():
         assert len(groups["language"]) == 4 and len(groups["vision"]) == 24
         vision, projector, text = model.model.visual, None, model.model.language_model
         shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(text)
+        shared_text_kernels["bf16_clamped_mlp_modules"] = install_text_mlp(text)
 
         def forward():
             return model(
@@ -188,24 +189,25 @@ def main():
                 handles.append(child.register_forward_hook(hook("vision." + name)))
     for i, layer in enumerate(text.layers.values()):
         handles.append(layer.register_forward_hook(hook(f"layer{i}", "hidden_states" if args.backend == "xtuner" else None)))
-        if i == 0:
-            def capture_input(module, inputs, kwargs):
+        if i in (0, 1):
+            def capture_input(module, inputs, kwargs, i=i):
                 if rank == 0:
                     value = inputs[0] if inputs else kwargs["hidden_states"]
-                    captures["layer0.input"] = value.detach().cpu().contiguous()
+                    captures[f"layer{i}.input"] = value.detach().cpu().contiguous()
             handles.append(layer.register_forward_pre_hook(capture_input, with_kwargs=True))
             for name in ("input_layernorm", "post_attention_layernorm", "self_attn", "mlp"):
                 child = getattr(layer, name)
                 key = "projected_output" if args.backend == "xtuner" and name == "self_attn" else None
-                handles.append(child.register_forward_hook(hook(f"layer0.{name}", key)))
+                handles.append(child.register_forward_hook(hook(f"layer{i}.{name}", key)))
                 if name.endswith("layernorm"):
-                    def capture_norm_input(module, inputs, output, name=name, layer=layer):
+                    def capture_norm_input(module, inputs, output, name=name, layer=layer, i=i):
                         if rank == 0:
-                            captures[f"layer0.{name}.input"] = inputs[0].detach().cpu().contiguous()
+                            captures[f"layer{i}.{name}.input"] = inputs[0].detach().cpu().contiguous()
                             weight = module.weight
                             weight = weight.to_local() if hasattr(weight, "to_local") else weight
-                            captures[f"parameter.{name}.weight"] = weight.detach().cpu().contiguous()
-                            if name == "input_layernorm":
+                            if i == 0:
+                                captures[f"parameter.{name}.weight"] = weight.detach().cpu().contiguous()
+                            if name == "input_layernorm" and i == 0:
                                 for suffix in ("fn", "scale", "base"):
                                     if args.backend == "automodel" and suffix != "fn":
                                         continue
@@ -214,7 +216,7 @@ def main():
                                     value = value.to_local() if hasattr(value, "to_local") else value
                                     captures["parameter.hc_attn_" + suffix] = value.detach().cpu().contiguous()
                     handles.append(child.register_forward_hook(capture_norm_input))
-            if args.backend == "automodel":
+            if args.backend == "automodel" and i == 0:
                 def capture_fp32_holder(module, inputs):
                     if rank == 0:
                         for suffix in ("scale", "base"):
