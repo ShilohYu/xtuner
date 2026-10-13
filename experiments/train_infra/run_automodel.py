@@ -1,6 +1,7 @@
 """Native NeMo GLM training on hash-verified XTuner packs, with matched losses."""
 
 import argparse
+import inspect
 import json
 import os
 from dataclasses import asdict
@@ -26,6 +27,20 @@ def register_glm_layers(parallelizer, model_class):
 
     # The checkout's generic heuristic selects only the 24-layer vision tower.
     parallelizer._get_model_layer_group_specs = matching_layer_specs
+
+
+def register_flash_mla_compat(sparse_attention):
+    native = sparse_attention._FLASH_MLA_SPARSE_FWD
+    if "indexer_topk" in inspect.signature(native).parameters:
+        return False
+
+    def legacy_forward(*args, indexer_topk=0, **kwargs):
+        # The installed pre-indexer API already consumes explicit sparse indices and lengths.
+        assert indexer_topk == 0, "Legacy FlashMLA cannot implement a nonzero indexer_topk"
+        return native(*args, **kwargs)
+
+    sparse_attention._FLASH_MLA_SPARSE_FWD = legacy_forward
+    return True
 
 
 def main():
@@ -55,6 +70,7 @@ def main():
     from nemo_automodel.components.distributed.mesh import ParallelismSizes
     from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
     from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.common import cudnn_sparse_attention
     from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
     from nemo_automodel.components.training.utils import (
         prepare_for_final_backward, prepare_for_grad_accumulation, scale_grads_and_clip_grad_norm,
@@ -72,6 +88,7 @@ def main():
     activation_checkpointing.checkpoint_wrapper = matching_checkpoint_wrapper
     parallelizer.checkpoint_wrapper = matching_checkpoint_wrapper
     register_glm_layers(parallelizer, Glm5NextForConditionalGeneration)
+    legacy_flash_mla = register_flash_mla_compat(cudnn_sparse_attention)
 
     strategy = FSDP2Config(
         enable_compile=cfg["fsdp_cfg"]["torch_compile"], activation_checkpointing=True,
@@ -150,6 +167,7 @@ def main():
                 "model_class": type(model).__name__, "auxiliary_loss": balance_cfg.model_dump(),
                 "master_dtype": "float32", "reduce_dtype": "bfloat16",
                 "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"],
+                "legacy_flash_mla_zero_indexer_adapter": legacy_flash_mla,
                 "layer_groups": {name: len(layers) for name, layers in groups.items()},
                 "checkpoint_wrappers": checkpoint_counts, "auxiliary_gates": gates}
     (args.out / f"environment_rank{rank}.json").write_text(json.dumps(manifest, default=str, indent=2))
