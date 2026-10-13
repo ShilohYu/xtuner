@@ -81,6 +81,8 @@ def install():
         result = train(self, batches)
         loss = torch.tensor(result["total_loss"], device="cuda", dtype=torch.float64)
         dist.all_reduce(loss)
+        # Native CE and balancing loss already report the global value on every rank.
+        loss /= dist.get_world_size()
         self._experiment_loss = loss.item()
         return result
 
