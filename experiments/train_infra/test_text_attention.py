@@ -24,6 +24,7 @@ def test_text_norm_adapter_preserves_native_vision(monkeypatch):
     torch.manual_seed(23)
     visual = vision.Glm5NextRMSNorm(32, 1e-5, torch.bfloat16)
     text = layers.Glm5NextRMSNorm(32, 1e-5, torch.bfloat16)
+    gated = layers._TorchRMSNormGated(32, 1e-5, torch.bfloat16)
     inputs = torch.randn(2, 37, 32, dtype=torch.bfloat16)
     with torch.no_grad():
         visual.weight.uniform_(0.5, 1.5)
@@ -31,7 +32,8 @@ def test_text_norm_adapter_preserves_native_vision(monkeypatch):
         baseline = visual(inputs)
         native_forward = layers.Glm5NextRMSNorm.forward
         install_shared_text_kernels(layers)
-        assert install_text_rms_norm(torch.nn.ModuleList([text])) == 1
+        assert install_text_rms_norm(torch.nn.ModuleList([text, gated])) == 1
+        assert gated.forward.__func__ is layers._TorchRMSNormGated.forward
         assert layers.Glm5NextRMSNorm.forward is native_forward
         torch.testing.assert_close(visual(inputs), baseline, atol=0, rtol=0)
         torch.testing.assert_close(text(inputs), rms_norm(inputs, text.weight, 1e-5), atol=0, rtol=0)

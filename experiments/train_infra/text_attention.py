@@ -12,11 +12,11 @@ def _text_rms_norm(self, hidden_states):
 
 
 def install_text_rms_norm(text):
-    from nemo_automodel.components.models.glm5_next.layers import Glm5NextRMSNorm
+    from nemo_automodel.components.models.glm5_next.layers import Glm5NextRMSNorm, _TorchRMSNormGated
 
     count = 0
     for module in text.modules():
-        if isinstance(module, Glm5NextRMSNorm):
+        if isinstance(module, Glm5NextRMSNorm) and not isinstance(module, _TorchRMSNormGated):
             # ViT shares this class but has its own FP32-statistics/cast/affine order.
             module.forward = MethodType(_text_rms_norm, module)
             count += 1
