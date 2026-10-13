@@ -93,6 +93,9 @@ def main():
         import matplotlib.pyplot as plt
 
         figure, axes = plt.subplots(1, 2, figsize=(11, 4), layout="constrained")
+        individual = {key: plt.subplots(figsize=(8, 4), layout="constrained")
+                      for key in ("loss", "grad_norm")}
+        plot_axes = list(zip(axes, ("loss", "grad_norm"))) + [(ax, key) for key, (_, ax) in individual.items()]
         for status in statuses:
             rows = sorted((row for row in metrics if row["run"] == status["run"] and row["rank"] == 0),
                           key=lambda row: row["step"])
@@ -107,15 +110,19 @@ def main():
                     label += " INCOMPLETE"
                 if status.get("vision_attention_aligned") is False:
                     label += " (old ViT SDPA baseline)"
-                for axis, key in zip(axes, ("loss", "grad_norm")):
+                for axis, key in plot_axes:
                     line, = axis.plot([row["step"] for row in rows], [row[key] for row in rows],
                                       label=label, marker="o", markersize=3)
                     if not status["optimizer_steps_complete"]:
                         axis.axvline(rows[-1]["step"], color=line.get_color(), linestyle="--", alpha=0.5)
-                    axis.set(xlabel="Optimizer step (zero based)", ylabel=key)
+                    axis.set(xlabel="Optimizer step (zero based)",
+                             ylabel="Global L2 grad norm (before clipping)" if key == "grad_norm" else "Loss")
                     axis.legend(fontsize=6)
         figure.suptitle("Recorded optimizer steps only; dashed line marks an incomplete run's last step")
         figure.savefig(args.out / "loss_grad_norm.png", dpi=180)
+        for key, (single_figure, ax) in individual.items():
+            ax.set_title("Recorded optimizer steps; dashed line marks incomplete runs")
+            single_figure.savefig(args.out / f"{key}.png", dpi=180)
     print(json.dumps(statuses, indent=2))
 
 
