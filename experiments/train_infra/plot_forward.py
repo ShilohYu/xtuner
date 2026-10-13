@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
 
+from experiments.train_infra.record import tensor_hash
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -41,7 +43,23 @@ def main():
         assert ma["parameters"] == mb["parameters"]
     report = {"xtuner": str(args.xtuner), "automodel": str(args.automodel),
               "inputs_equal": True, "diagnostic": ma.get("diagnostic"),
+              "experiment_heads": [ma.get("experiment_head"), mb.get("experiment_head")],
               "stages": {key: errors(a[key], b[key]) for key in a if key not in ("positions", "labels")}}
+    if (args.xtuner / "visual_load_audit.json").exists():
+        audits = [json.loads((path / "visual_load_audit.json").read_text()) for path in (args.xtuner, args.automodel)]
+        for key in ("parameters", "inv_freq", "inv_freq_dtype"):
+            assert audits[0][key] == audits[1][key], f"Visual loading differs: {key}"
+        report["visual_parameters_equal"] = len(audits[0]["parameters"])
+    if "fixture" in ma:
+        fixture = load_file(ma["fixture"])
+        assert {k: tensor_hash(v) for k, v in fixture.items()} == ma["input_hashes"]
+        masks = {"real_tokens": ~fixture["padding_mask"][0].bool(),
+                 "supervised_tokens": fixture["labels"][0] != -100,
+                 "padding": fixture["padding_mask"][0].bool()}
+        report["token_scopes"] = {
+            key: {scope: errors(a[key][:, mask], b[key][:, mask]) for scope, mask in masks.items() if mask.any()}
+            for key in a if key.startswith("layer") or key == "final_norm"
+        }
     if "logits" not in a:
         stages = ["patch_embed", *[f"blocks.{i}" for i in range(24)], "post_layernorm", "downsample", "merger"]
         fig, ax = plt.subplots(figsize=(12, 4), layout="constrained")
@@ -66,9 +84,9 @@ def main():
             writer.writeheader()
             writer.writerows(rows)
         fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
-        stages = ["visual_features", "embed_tokens", "layer0.input", "layer0", "layer1", "layer2", "layer3", "final_norm"]
-        axes[0, 0].bar(stages, [report["stages"][key]["relative_l2"] for key in stages])
-        axes[0, 0].set(ylabel="Relative L2 error", title="Forward hidden states")
+        stages = ["visual_features", "embed_tokens", "layer0.input", "layer0.input_layernorm", "layer0", "layer1", "layer2", "layer3", "final_norm"]
+        axes[0, 0].bar(stages, [report.get("token_scopes", {}).get(key, {}).get("real_tokens", report["stages"][key])["relative_l2"] for key in stages])
+        axes[0, 0].set(ylabel="Relative L2 error", title="Forward hidden states (real tokens; padding excluded)")
         axes[0, 0].tick_params(axis="x", rotation=35)
         axes[0, 1].plot(positions, rel)
         axes[0, 1].set(xlabel="Supervised token position", ylabel="Logits relative L2 error")

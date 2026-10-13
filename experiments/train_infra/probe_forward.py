@@ -194,6 +194,29 @@ def main():
                 child = getattr(layer, name)
                 key = "projected_output" if args.backend == "xtuner" and name == "self_attn" else None
                 handles.append(child.register_forward_hook(hook(f"layer0.{name}", key)))
+                if name.endswith("layernorm"):
+                    def capture_norm_input(module, inputs, output, name=name):
+                        if rank == 0:
+                            captures[f"layer0.{name}.input"] = inputs[0].detach().cpu().contiguous()
+                            weight = module.weight
+                            weight = weight.to_local() if hasattr(weight, "to_local") else weight
+                            captures[f"parameter.{name}.weight"] = weight.detach().cpu().contiguous()
+                    handles.append(child.register_forward_hook(capture_norm_input))
+            if args.backend == "automodel":
+                def capture_hc_params(module, inputs, output):
+                    if rank == 0:
+                        for name, value in module.named_parameters():
+                            value = value.to_local() if hasattr(value, "to_local") else value
+                            captures["parameter.hc_attn_" + name.replace("_fp32_params.", "")] = value.detach().cpu().contiguous()
+                handles.append(layer.attn_hc.register_forward_hook(capture_hc_params))
+            else:
+                def capture_xt_hc_params(module, inputs, output):
+                    if rank == 0:
+                        for suffix in ("fn", "scale", "base"):
+                            value = getattr(module, "hc_attn_" + suffix)
+                            value = value.to_local() if hasattr(value, "to_local") else value
+                            captures["parameter.hc_attn_" + suffix] = value.detach().cpu().contiguous()
+                handles.append(layer.register_forward_hook(capture_xt_hc_params))
 
     print(f"STAGE rank={rank} observed_forward", flush=True)
     with torch.no_grad():
