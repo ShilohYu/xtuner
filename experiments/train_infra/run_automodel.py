@@ -46,6 +46,17 @@ def main():
     )
     from xtuner.v1.loss.moe_loss import BalancingLossConfig
 
+    from nemo_automodel.components.distributed import activation_checkpointing, parallelizer
+
+    native_checkpoint_wrapper = activation_checkpointing.checkpoint_wrapper
+
+    def matching_checkpoint_wrapper(*args, **kwargs):
+        kwargs["preserve_rng_state"] = cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"]
+        return native_checkpoint_wrapper(*args, **kwargs)
+
+    activation_checkpointing.checkpoint_wrapper = matching_checkpoint_wrapper
+    parallelizer.checkpoint_wrapper = matching_checkpoint_wrapper
+
     strategy = FSDP2Config(
         enable_compile=cfg["fsdp_cfg"]["torch_compile"], activation_checkpointing=True,
         defer_fsdp_grad_sync=False, reshard_after_forward=True,
@@ -110,7 +121,8 @@ def main():
     manifest = {"reference": str(args.reference), "backend": asdict(backend),
                 "strategy": asdict(strategy), "torch": torch.__version__,
                 "model_class": type(model).__name__, "auxiliary_loss": balance_cfg.model_dump(),
-                "master_dtype": "float32", "reduce_dtype": "bfloat16"}
+                "master_dtype": "float32", "reduce_dtype": "bfloat16",
+                "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"]}
     (args.out / f"environment_rank{rank}.json").write_text(json.dumps(manifest, default=str, indent=2))
     for entry in replay.entries:
         torch.cuda.reset_peak_memory_stats()
