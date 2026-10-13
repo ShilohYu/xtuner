@@ -3,7 +3,6 @@
 import argparse
 import importlib.metadata
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +21,7 @@ def main():
     parser.add_argument("--backend", choices=["xtuner", "automodel"], required=True)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--cast-forward-inputs", action="store_true", help="Replay native FSDP argument downcasts")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     torch.cuda.set_device(0)
@@ -99,7 +99,7 @@ def main():
         del state
         vision.cuda()
         policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16,
-                                      cast_forward_inputs=False)
+                                      cast_forward_inputs=args.cast_forward_inputs)
         for block in vision.blocks:
             fully_shard(block, mp_policy=policy)
         fully_shard(vision, mp_policy=policy)
@@ -144,6 +144,7 @@ def main():
                 "counters": counters, "profiler_events": events, "training": True, "frozen": True,
                 "compile": False, "compute_dtype": "bfloat16", "master_dtype": "float32",
                 "reduce_dtype": "bfloat16", "deterministic": False, "optimizer_steps": 0,
+                "cast_forward_inputs": args.cast_forward_inputs,
                 "diagnostic": "world1/no_grad/full 8K pack pixels; not a reference training pass",
                 "xtuner_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()}
     (args.out / "metadata.json").write_text(json.dumps(metadata, indent=2))

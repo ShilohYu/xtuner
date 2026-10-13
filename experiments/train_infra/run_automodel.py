@@ -102,6 +102,7 @@ def main():
         defer_fsdp_grad_sync=False, reshard_after_forward=True,
         mp_policy=torch.distributed.fsdp.MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, output_dtype=torch.bfloat16,
+            cast_forward_inputs=False,
         ),
     )
     setup = DistributedSetup.build(strategy=strategy, parallelism_sizes=ParallelismSizes(ep_size=1),

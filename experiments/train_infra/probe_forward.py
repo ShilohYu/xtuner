@@ -98,7 +98,8 @@ def main():
             enable_compile=False, activation_checkpointing=True, defer_fsdp_grad_sync=False,
             reshard_after_forward=True,
             mp_policy=torch.distributed.fsdp.MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, output_dtype=torch.bfloat16),
+                param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, output_dtype=torch.bfloat16,
+                cast_forward_inputs=False),
         )
         setup = DistributedSetup.build(strategy=strategy, parallelism_sizes=ParallelismSizes(ep_size=1),
                                        activation_checkpointing=True)
@@ -169,6 +170,12 @@ def main():
     handles.append(text.norm.register_forward_hook(hook("final_norm")))
     feature_module = projector if projector is not None else vision.merger
     handles.append(feature_module.register_forward_hook(hook("visual_features")))
+    def capture_rope(module, inputs):
+        if rank == 0:
+            embeddings = inputs[3 if args.backend == "xtuner" else 2]
+            captures["vision.rope_cos"] = embeddings[0].detach().cpu().contiguous()
+            captures["vision.rope_sin"] = embeddings[1].detach().cpu().contiguous()
+    handles.append(vision.blocks[0].register_forward_pre_hook(capture_rope))
     for module in ((vision, projector) if projector is not None else (vision,)):
         for name, child in module.named_modules():
             if name in ("patch_embed", "post_layernorm", "downsample", "merger") or (
@@ -200,6 +207,7 @@ def main():
         metadata = {"backend": args.backend, "torch": torch.__version__, "fixture": str(args.fixture),
                     "input_hashes": {k: tensor_hash(v) for k, v in fixture.items()},
                     "training": True, "freeze_vision_and_projector": True, "compile": False,
+                    "cast_forward_inputs": False,
                     "no_grad": True, "world": 8, "ep": 1, "sp": 1, "optimizer_steps": 0,
                     "observation_preserves_logits": True, "router_bias_unchanged": True,
                     "experiment_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
