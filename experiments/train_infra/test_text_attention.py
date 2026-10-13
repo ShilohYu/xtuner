@@ -17,7 +17,8 @@ def test_text_norm_adapter_preserves_native_vision(monkeypatch):
     from nemo_automodel.components.models.glm5_next import vision
     from xtuner.v1.ops import rms_norm
 
-    for cls in (layers.Glm5NextRMSNorm, layers.Glm5NextUnweightedRMSNorm, layers._TorchRMSNormGated):
+    for cls in (layers.Glm5NextRMSNorm, layers.Glm5NextUnweightedRMSNorm,
+                layers._TorchRMSNormGated, layers.Glm5NextDecoderLayer):
         monkeypatch.setattr(cls, "forward", cls.forward)
     for name in ("_chunk_kda", "_fused_kda_gate", "_fla_causal_conv1d"):
         monkeypatch.setattr(layers, name, getattr(layers, name))
@@ -39,11 +40,59 @@ def test_text_norm_adapter_preserves_native_vision(monkeypatch):
         torch.testing.assert_close(text(inputs), rms_norm(inputs, text.weight, 1e-5), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("moe", [False, True])
+def test_native_decoder_preserves_both_residual_paths(monkeypatch, moe):
+    from nemo_automodel.components.models.common import BackendConfig
+    from xtuner.v1.module.decoder_layer.mhc import hc_post
+
+    for cls in (layers.Glm5NextUnweightedRMSNorm, layers._TorchRMSNormGated, layers.Glm5NextDecoderLayer):
+        monkeypatch.setattr(cls, "forward", cls.forward)
+    for name in ("_chunk_kda", "_fused_kda_gate", "_fla_causal_conv1d"):
+        monkeypatch.setattr(layers, name, getattr(layers, name))
+
+    class Update(torch.nn.Linear):
+        def forward(self, x, padding_mask=None, **kwargs):
+            assert padding_mask is mask
+            return super().forward(x)
+
+    torch.manual_seed(29)
+    cfg = Glm5NextTextConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+                            layer_types=["linear_attention"], mlp_layer_types=["dense"],
+                            linear_num_heads=2, linear_head_dim=128)
+    layer = layers.Glm5NextDecoderLayer(cfg, 0, None, BackendConfig(linear="torch"))
+    layer.self_attn = Update(32, 32, bias=False, dtype=torch.bfloat16)
+    layer.is_moe_layer = moe
+    if moe:
+        layer.mlp = Update(32, 32, bias=False, dtype=torch.bfloat16)
+    with torch.no_grad():
+        for p in layer.parameters():
+            p.normal_(std=0.1)
+    parameter_ids = {n: id(p) for n, p in layer.named_parameters()}
+    install_shared_text_kernels(layers)
+    install_text_rms_norm(layer)
+    assert parameter_ids == {n: id(p) for n, p in layer.named_parameters()}
+    mask = torch.zeros(1, 7, dtype=torch.bool)
+    x = torch.randn(1, 7, cfg.hc_mult, 32, dtype=torch.bfloat16, requires_grad=True)
+    post, comb, collapsed = layer.attn_hc(x)
+    update = layer.self_attn(layer.input_layernorm(collapsed), padding_mask=mask)
+    intermediate = hc_post(update, x, post, comb)
+    post, comb, collapsed = layer.ffn_hc(intermediate)
+    normalized = layer.post_attention_layernorm(collapsed)
+    update = layer.mlp(normalized, mask) if moe else layer.mlp(normalized)
+    expected = hc_post(update, intermediate, post, comb)
+    actual = layer(x, packed_context=None, padding_mask=mask)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    actual.float().square().sum().backward()
+    assert torch.isfinite(x.grad).all()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in layer.parameters())
+
+
 @pytest.mark.gpu
 def test_packed_native_kda_forward_and_backward(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for the real KDA kernels")
-    for cls in (layers.Glm5NextRMSNorm, layers.Glm5NextUnweightedRMSNorm, layers._TorchRMSNormGated):
+    for cls in (layers.Glm5NextRMSNorm, layers.Glm5NextUnweightedRMSNorm,
+                layers._TorchRMSNormGated, layers.Glm5NextDecoderLayer):
         monkeypatch.setattr(cls, "forward", cls.forward)
     for name in ("_chunk_kda", "_fused_kda_gate", "_fla_causal_conv1d"):
         monkeypatch.setattr(layers, name, getattr(layers, name))
