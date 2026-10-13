@@ -7,6 +7,12 @@ import math
 from pathlib import Path
 
 
+def optimizer_steps_complete(rank_rows, expected_steps):
+    return len(rank_rows) == 8 and expected_steps is not None and expected_steps > 0 and all(
+        [row["step"] for row in rows] == list(range(expected_steps)) for rows in rank_rows
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=Path, required=True)
@@ -33,7 +39,7 @@ def main():
         status = {"run": run.name, "exit_code": exit_code, "rank_step_counts": counts,
                   "finite_metrics": finite if min(counts) else None,
                   "nonzero_updates_all_ranks": updated,
-                  "optimizer_gate_passed": exit_code == 0 and counts == [20] * 8 and finite and updated}
+                  "optimizer_gate_passed": exit_code == 0 and finite and updated}
         environment = run / "environment_rank0.json"
         native = json.loads(environment.read_text()) if environment.is_file() else {}
         config = run / "resolved_config.json"
@@ -50,13 +56,18 @@ def main():
         status["diagnostic_stopped"] = (run / "DIAGNOSTIC_STOPPED.txt").exists()
         status["configuration_validated"] = valid
         status["optimizer_gate_passed"] &= valid
+        expected_steps = None
         if config.is_file():
             cfg = json.loads(config.read_text())
+            expected_steps = cfg.get("total_step")
             status.update(pack_length=cfg["dataloader_cfg"]["pack_max_length"], sp_size=cfg["sp_size"],
                           ep_size=cfg["fsdp_cfg"]["ep_size"], compile=cfg["fsdp_cfg"]["torch_compile"])
             status["reference_configuration"] = (status["pack_length"] == 65536 and
                                                  status["sp_size"] == 1 and status["ep_size"] == 1 and
                                                  status["compile"] and valid)
+        status["expected_steps"] = expected_steps
+        status["optimizer_steps_complete"] = optimizer_steps_complete(rank_rows, expected_steps)
+        status["optimizer_gate_passed"] &= status["optimizer_steps_complete"]
         if reference is not None and rank_rows[0]:
             reference_metrics = reference / "metrics_rank0.jsonl"
             baseline = {row["step"]: row for row in map(json.loads, reference_metrics.read_text().splitlines())} \
@@ -87,12 +98,23 @@ def main():
                           key=lambda row: row["step"])
             if rows:
                 label = status["run"]
+                label += f" ({len(rows)}/{status['expected_steps'] or '?'} steps)"
+                if status["diagnostic_stopped"]:
+                    label += " STOPPED"
+                elif status["exit_code"] not in (0, None):
+                    label += " FAILED"
+                elif not status["optimizer_steps_complete"]:
+                    label += " INCOMPLETE"
                 if status.get("vision_attention_aligned") is False:
                     label += " (old ViT SDPA baseline)"
                 for axis, key in zip(axes, ("loss", "grad_norm")):
-                    axis.plot([row["step"] for row in rows], [row[key] for row in rows], label=label)
+                    line, = axis.plot([row["step"] for row in rows], [row[key] for row in rows],
+                                      label=label, marker="o", markersize=3)
+                    if not status["optimizer_steps_complete"]:
+                        axis.axvline(rows[-1]["step"], color=line.get_color(), linestyle="--", alpha=0.5)
                     axis.set(xlabel="Optimizer step (zero based)", ylabel=key)
                     axis.legend(fontsize=6)
+        figure.suptitle("Recorded optimizer steps only; dashed line marks an incomplete run's last step")
         figure.savefig(args.out / "loss_grad_norm.png", dpi=180)
     print(json.dumps(statuses, indent=2))
 
