@@ -88,6 +88,7 @@ class NoAuxRouter(nn.Module, RouterProtocol):
             noise = torch.randn_like(scores) * 50
             scores_for_choice = scores + noise
 
+        selection_scores = scores_for_choice
         if self.n_group != self.topk_group:
             assert len(logits.shape) == 2, (
                 f"XTuner Internal bug, invalid logits shape: {logits.shape}, expected shape with "
@@ -110,11 +111,14 @@ class NoAuxRouter(nn.Module, RouterProtocol):
                 )
                 .reshape(bsz * seq_len, -1)
             )  # [n, e]
+            # Excluded groups must never outrank negative corrected scores. Keep
+            # the finite, zero-masked distribution for the existing auxiliary loss.
+            selection_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
             scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
 
         # select top-k experts
         # (only applicable when ep_size >= 64. when ep_size=32 (4 nodes), there is no need to employ this strategy)
-        _, topk_idx = torch.topk(scores_for_choice, k=self.top_k, dim=-1)
+        _, topk_idx = torch.topk(selection_scores, k=self.top_k, dim=-1)
 
         if rollout_routed_experts is not None:
             # seq_l, expert
