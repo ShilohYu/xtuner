@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--forward", type=Path, required=True)
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--shared-text-kernels", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(exist_ok=False, parents=True)
     model_path = Path("/tmp/GLM-5.3-Flash-4layer")
@@ -46,6 +47,10 @@ def main():
     fixture = {k: v.cuda() for k, v in load_file(str(args.fixture)).items()}
     valid = ~fixture["padding_mask"][0].bool()
     report = {}
+    if args.shared_text_kernels:
+        from nemo_automodel.components.models.glm5_next import layers
+        from experiments.train_infra.text_attention import install_shared_text_kernels
+        report["shared_text_kernels"] = install_shared_text_kernels(layers)
 
     def compare(name, x, y):
         report[name] = {"all": errors(x, y), "real_tokens": errors(x[:, valid], y[:, valid])}
@@ -72,6 +77,10 @@ def main():
         compare("same_input_norm", norms[0](xt_collapsed), norms[1](xt_collapsed))
         compare("xtuner_runtime_replay", x, captured("xtuner", "layer0.input_layernorm"))
         compare("automodel_runtime_replay", y, captured("automodel", "layer0.input_layernorm"))
+        hc._fp32_params.bfloat16()
+        _, _, rounded_collapsed = hc(streams)
+        compare("bf16_holder_runtime_replay", norms[1](rounded_collapsed),
+                captured("automodel", "layer0.input_layernorm"))
 
         xt_cfg = Glm53TextMoEConfig.from_hf(model_path)
         xt = xt_cfg.linear_attention.build(hidden_size=cfg.hidden_size).cuda().bfloat16()
@@ -101,6 +110,10 @@ def main():
         for name in captures[0]:
             compare("same_input_kda." + name, captures[0][name], captures[1][name])
         compare("same_input_kda.output", xo, yo)
+        if args.shared_text_kernels:
+            assert torch.equal(xt_collapsed, am_collapsed), "Same-input mHC still differs"
+            assert torch.equal(x, y), "Same-input RMSNorm still differs"
+            assert torch.equal(xo, yo), "Same-input native KDA still differs"
         report["diagnostic"] = "Single GPU, same full 8K layer0 inputs and checkpoint weights; no backward"
         (args.out / "comparison.json").write_text(json.dumps(report, indent=2))
 

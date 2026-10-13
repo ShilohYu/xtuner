@@ -80,9 +80,11 @@ def main():
         from nemo_automodel.components.distributed.mesh import ParallelismSizes
         from nemo_automodel.components.models.common import BackendConfig, cudnn_sparse_attention
         from nemo_automodel.components.models.glm5_next import vision as native_vision
+        from nemo_automodel.components.models.glm5_next import layers as native_layers
         from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
         from experiments.train_infra.run_automodel import register_glm_layers, register_flash_mla_compat
         from experiments.train_infra.vision_attention import install_flash_attention_2
+        from experiments.train_infra.text_attention import install_shared_text_kernels
 
         native_checkpoint = activation_checkpointing.checkpoint_wrapper
 
@@ -94,6 +96,7 @@ def main():
         register_glm_layers(parallelizer, Glm5NextForConditionalGeneration)
         register_flash_mla_compat(cudnn_sparse_attention)
         install_flash_attention_2(native_vision, flash_attn_varlen_func)
+        shared_text_kernels = install_shared_text_kernels(native_layers)
         strategy = FSDP2Config(
             enable_compile=False, activation_checkpointing=True, defer_fsdp_grad_sync=False,
             reshard_after_forward=True,
@@ -233,6 +236,7 @@ def main():
                     "input_hashes": {k: tensor_hash(v) for k, v in fixture.items()},
                     "training": True, "freeze_vision_and_projector": True, "compile": False,
                     "cast_forward_inputs": False,
+                    "shared_text_kernels": shared_text_kernels if args.backend == "automodel" else "native XTuner",
                     "no_grad": True, "world": 8, "ep": 1, "sp": 1, "optimizer_steps": 0,
                     "observation_preserves_logits": True, "router_bias_unchanged": True,
                     "experiment_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),

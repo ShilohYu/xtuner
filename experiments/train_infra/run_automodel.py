@@ -82,8 +82,10 @@ def main():
     from nemo_automodel.components.models.common import cudnn_sparse_attention
     from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
     from nemo_automodel.components.models.glm5_next import vision
+    from nemo_automodel.components.models.glm5_next import layers
     from flash_attn import flash_attn_varlen_func
     from experiments.train_infra.vision_attention import install_flash_attention_2
+    from experiments.train_infra.text_attention import install_shared_text_kernels
     from nemo_automodel.components.training.utils import (
         prepare_for_final_backward, prepare_for_grad_accumulation, scale_grads_and_clip_grad_norm,
     )
@@ -104,6 +106,7 @@ def main():
     assert os.environ.get("XTUNER_USE_FA3", "0") == "0", "Reference ViT uses FlashAttention 2"
     assert os.environ.get("XTUNER_DETERMINISTIC", "false") != "true"
     install_flash_attention_2(vision, flash_attn_varlen_func)
+    shared_text_kernels = install_shared_text_kernels(layers)
 
     strategy = FSDP2Config(
         enable_compile=cfg["fsdp_cfg"]["torch_compile"], activation_checkpointing=True,
@@ -182,6 +185,7 @@ def main():
                 "strategy": asdict(strategy), "torch": torch.__version__,
                 "model_class": type(model).__name__, "auxiliary_loss": balance_cfg.model_dump(),
                 "master_dtype": "float32", "reduce_dtype": "bfloat16",
+                "shared_text_kernels": shared_text_kernels,
                 "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"],
                 "legacy_flash_mla_zero_indexer_adapter": legacy_flash_mla,
                 "vision_attention": {"implementation": "flash_attention_2_varlen",

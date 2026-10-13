@@ -15,7 +15,7 @@ if [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]]; then
   exit 75
 fi
 mkdir "$diagnostic_out"
-cp experiments/train_infra/{probe_forward.py,vision_attention.py,run_automodel.py,run_forward.sh} "$diagnostic_out/"
+cp experiments/train_infra/{probe_forward.py,vision_attention.py,text_attention.py,run_automodel.py,run_forward.sh} "$diagnostic_out/"
 git rev-parse HEAD > "$diagnostic_out/experiment_sha.txt"
 git diff HEAD --binary > "$diagnostic_out/code.patch"
 git -C /mnt/shared-storage-user/yushan/GLM-5.3-flash-integration/automodel rev-parse HEAD > "$diagnostic_out/automodel_sha.txt"
