@@ -54,6 +54,15 @@ def install():
     clip = TrainEngine.clip_grad_norm
     train = TrainEngine.train_step
     optimize = TrainEngine.step_optimizer
+    build_model = TrainEngine.build_model
+
+    def build_record(self):
+        model = build_model(self)
+        if os.environ.get("TRAIN_INFRA_XTUNER_HF_NORM") == "1":
+            from experiments.train_infra.text_attention import install_xtuner_hf_rms_norm
+            count = install_xtuner_hf_rms_norm(model.language_model)
+            (out / f"norm_adapter_rank{dist.get_rank()}.json").write_text(json.dumps({"modules": count}))
+        return model
 
     def prepare_record(self, batches):
         step, rank = self.cur_step, dist.get_rank()
@@ -77,6 +86,9 @@ def install():
 
     def train_record(self, batches):
         self._experiment_step = getattr(self, "_experiment_step", 0)
+        if self._experiment_step == 0 and os.environ.get("TRAIN_INFRA_LOGITS_FIXTURE"):
+            from experiments.train_infra.training_logits import capture_logits
+            capture_logits(self.model, "xtuner", out, 0)
         diagnose = os.environ.get("TRAIN_INFRA_MEMORY_SNAPSHOT") == "1"
         if diagnose and self._experiment_step == 0:
             torch.cuda.memory._record_memory_history(max_entries=100000)
@@ -124,12 +136,16 @@ def install():
         with (out / f"metrics_rank{dist.get_rank()}.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
         self._experiment_step += 1
+        if self._experiment_step == int(os.environ.get("TRAIN_INFRA_STEPS") or -1) and os.environ.get("TRAIN_INFRA_LOGITS_FIXTURE"):
+            from experiments.train_infra.training_logits import capture_logits
+            capture_logits(self.model, "xtuner", out, self._experiment_step)
         return result
 
     Trainer._prepare_model_input = prepare_record
     TrainEngine.train_step = train_record
     TrainEngine.clip_grad_norm = clip_record
     TrainEngine.step_optimizer = optimize_record
+    TrainEngine.build_model = build_record
 
 
 if __name__ == "__main__":

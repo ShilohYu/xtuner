@@ -106,7 +106,8 @@ def main():
     assert os.environ.get("XTUNER_USE_FA3", "0") == "0", "Reference ViT uses FlashAttention 2"
     assert os.environ.get("XTUNER_DETERMINISTIC", "false") != "true"
     install_flash_attention_2(vision, flash_attn_varlen_func)
-    shared_text_kernels = install_shared_text_kernels(layers)
+    native_text = os.environ.get("TRAIN_INFRA_NATIVE_TEXT") == "1"
+    shared_text_kernels = {"mode": "native AutoModel"} if native_text else install_shared_text_kernels(layers)
 
     strategy = FSDP2Config(
         enable_compile=cfg["fsdp_cfg"]["torch_compile"], activation_checkpointing=True,
@@ -123,17 +124,23 @@ def main():
                             gate_precision="float32", fake_balanced_gate=False,
                             enable_hf_state_dict_adapter=True, enable_fsdp_optimizations=True)
     print(f"STAGE rank={rank} load_model", flush=True)
+    frozen_modules = [{"glob": "*.self_attn.indexer"}]
+    if cfg["model_cfg"].get("freeze_vision"):
+        frozen_modules.append({"glob": "model.visual"})
     model = NeMoAutoModelForImageTextToText.from_pretrained(
         "/tmp/GLM-5.3-Flash-4layer-with-processor", dtype=torch.float32,
         _restore_loaded_dtype=False, force_hf=False, backend=backend,
         distributed_setup=setup, attn_implementation="sdpa",
         use_liger_kernel=False, use_sdpa_patching=False, has_packed_sequence=True,
-        freeze_config={"freeze_modules": [{"glob": "*.self_attn.indexer"}]},
+        freeze_config={"freeze_modules": frozen_modules},
         text_config={"num_nextn_predict_layers": 0, "output_hidden_states": False},
     ).train()
     assert isinstance(model, Glm5NextForConditionalGeneration), type(model)
-    shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(model.model.language_model)
-    shared_text_kernels["bf16_clamped_mlp_modules"] = install_text_mlp(model.model.language_model)
+    if not native_text:
+        shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(model.model.language_model)
+        shared_text_kernels["bf16_clamped_mlp_modules"] = install_text_mlp(model.model.language_model)
+    if cfg["model_cfg"].get("freeze_vision"):
+        assert not any(p.requires_grad for p in model.model.visual.parameters())
     assert not any(p.is_meta for p in model.parameters())
     groups = parallelizer.get_model_layer_groups(model)
     assert len(groups.get("language", [])) == 4 and len(groups.get("vision", [])) == 24, groups
@@ -142,7 +149,8 @@ def main():
     checkpoint_counts = {name: sum(isinstance(module, CheckpointWrapper) for layer in layers
                                    for module in layer.modules()) for name, layers in groups.items()}
     assert checkpoint_counts.get("language", 0) >= 8, checkpoint_counts
-    assert checkpoint_counts.get("vision", 0) >= 48, checkpoint_counts
+    if not cfg["model_cfg"].get("freeze_vision"):
+        assert checkpoint_counts.get("vision", 0) >= 48, checkpoint_counts
     parameters = [p for p in model.parameters() if p.requires_grad]
     assert all(p.dtype == torch.float32 for p in parameters), "FP32 master weights required"
     optimizer = torch.optim.AdamW(parameters, lr=2e-5, betas=(0.9, 0.95), eps=1e-8,
@@ -197,6 +205,9 @@ def main():
                 "layer_groups": {name: len(layers) for name, layers in groups.items()},
                 "checkpoint_wrappers": checkpoint_counts, "auxiliary_gates": gates}
     (args.out / f"environment_rank{rank}.json").write_text(json.dumps(manifest, default=str, indent=2))
+    if os.environ.get("TRAIN_INFRA_LOGITS_FIXTURE"):
+        from experiments.train_infra.training_logits import capture_logits
+        capture_logits(model, "automodel", args.out, 0)
     for entry in replay.entries:
         torch.cuda.reset_peak_memory_stats()
         print(f"STAGE rank={rank} step={entry['step']} replay_inputs", flush=True)
@@ -256,6 +267,8 @@ def main():
         with (args.out / f"metrics_rank{rank}.jsonl").open("a") as stream:
             stream.write(json.dumps(row) + "\n")
         del batches, batch, output, context
+    if os.environ.get("TRAIN_INFRA_LOGITS_FIXTURE"):
+        capture_logits(model, "automodel", args.out, len(replay.entries))
     dist.destroy_process_group()
 
 

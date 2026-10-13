@@ -29,6 +29,7 @@ model_cfg.text_config.lm_loss_cfg = loss_cfg
 model_cfg.text_config.attention.sparse_mla_backend = "flash_mla_cudnn"
 model_cfg.text_config.attention.indexer_backend = "tilelang"
 model_cfg.vision_config.attn_impl = "flash_attention"
+model_cfg.freeze_vision = model_cfg.freeze_projector = os.environ.get("TRAIN_INFRA_FREEZE_VISION", "0") == "1"
 model_cfg.compile_cfg = compile_enabled
 model_cfg.text_config.compile_cfg = compile_enabled
 
@@ -72,5 +73,5 @@ trainer = TrainerConfig(
     checkpoint_maxkeep=1000, snapshot_interval=500,
     # 【验证差异】保留日志、输入和参数更新指标，不保存数十 GB 的权重副本。
     debug_skip_save=True, work_dir=work_dir,
-    exp_tracker="tensorboard", profile_step=10, profile_memory=True,
+    exp_tracker="tensorboard", profile_step=int(os.environ.get("TRAIN_INFRA_PROFILE_STEP", "10")), profile_memory=True,
 )
