@@ -13,6 +13,20 @@ import torch.nn.functional as F
 from experiments.train_infra.replay import Replay
 
 
+def register_glm_layers(parallelizer, model_class):
+    native_layer_specs = parallelizer._get_model_layer_group_specs
+
+    def matching_layer_specs():
+        specs = native_layer_specs()
+        glm_groups = {"language": ["model.language_model.layers"], "vision": ["model.visual.blocks"]}
+        specs[model_class] = glm_groups
+        specs[f"FSDP{model_class.__name__}"] = glm_groups
+        return specs
+
+    # The checkout's generic heuristic selects only the 24-layer vision tower.
+    parallelizer._get_model_layer_group_specs = matching_layer_specs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path, required=True)
@@ -56,17 +70,7 @@ def main():
 
     activation_checkpointing.checkpoint_wrapper = matching_checkpoint_wrapper
     parallelizer.checkpoint_wrapper = matching_checkpoint_wrapper
-    native_layer_specs = parallelizer._get_model_layer_group_specs
-
-    def matching_layer_specs():
-        specs = native_layer_specs()
-        glm_groups = {"language": ["model.language_model.layers"], "vision": ["model.visual.blocks"]}
-        specs[Glm5NextForConditionalGeneration] = glm_groups
-        specs["FSDPGlm5NextForConditionalGeneration"] = glm_groups
-        return specs
-
-    # The checkout's generic heuristic selects only the 24-layer vision tower.
-    parallelizer._get_model_layer_group_specs = matching_layer_specs
+    register_glm_layers(parallelizer, Glm5NextForConditionalGeneration)
 
     strategy = FSDP2Config(
         enable_compile=cfg["fsdp_cfg"]["torch_compile"], activation_checkpointing=True,
