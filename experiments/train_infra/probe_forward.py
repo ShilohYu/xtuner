@@ -196,6 +196,9 @@ def main():
                     captures[f"layer{i}.input"] = value.detach().cpu().contiguous()
             handles.append(layer.register_forward_pre_hook(capture_input, with_kwargs=True))
             for name in ("input_layernorm", "post_attention_layernorm", "self_attn", "mlp"):
+                # XTuner's MoE block exposes routed/shared experts separately, without an mlp child.
+                if name == "mlp" and i != 0:
+                    continue
                 child = getattr(layer, name)
                 key = "projected_output" if args.backend == "xtuner" and name == "self_attn" else None
                 handles.append(child.register_forward_hook(hook(f"layer{i}.{name}", key)))
