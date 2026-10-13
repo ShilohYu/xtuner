@@ -56,6 +56,17 @@ def main():
 
     activation_checkpointing.checkpoint_wrapper = matching_checkpoint_wrapper
     parallelizer.checkpoint_wrapper = matching_checkpoint_wrapper
+    native_layer_specs = parallelizer._get_model_layer_group_specs
+
+    def matching_layer_specs():
+        specs = native_layer_specs()
+        glm_groups = {"language": ["model.language_model.layers"], "vision": ["model.visual.blocks"]}
+        specs[Glm5NextForConditionalGeneration] = glm_groups
+        specs["FSDPGlm5NextForConditionalGeneration"] = glm_groups
+        return specs
+
+    # The checkout's generic heuristic selects only the 24-layer vision tower.
+    parallelizer._get_model_layer_group_specs = matching_layer_specs
 
     strategy = FSDP2Config(
         enable_compile=cfg["fsdp_cfg"]["torch_compile"], activation_checkpointing=True,
@@ -81,6 +92,8 @@ def main():
     ).train()
     assert isinstance(model, Glm5NextForConditionalGeneration), type(model)
     assert not any(p.is_meta for p in model.parameters())
+    groups = parallelizer.get_model_layer_groups(model)
+    assert len(groups.get("language", [])) == 4 and len(groups.get("vision", [])) == 24, groups
     parameters = [p for p in model.parameters() if p.requires_grad]
     assert all(p.dtype == torch.float32 for p in parameters), "FP32 master weights required"
     optimizer = torch.optim.AdamW(parameters, lr=2e-5, betas=(0.9, 0.95), eps=1e-8,
@@ -122,7 +135,8 @@ def main():
                 "strategy": asdict(strategy), "torch": torch.__version__,
                 "model_class": type(model).__name__, "auxiliary_loss": balance_cfg.model_dump(),
                 "master_dtype": "float32", "reduce_dtype": "bfloat16",
-                "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"]}
+                "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"],
+                "layer_groups": {name: len(layers) for name, layers in groups.items()}}
     (args.out / f"environment_rank{rank}.json").write_text(json.dumps(manifest, default=str, indent=2))
     for entry in replay.entries:
         torch.cuda.reset_peak_memory_stats()
