@@ -5,6 +5,7 @@ import inspect
 import importlib.metadata
 import json
 import os
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 
@@ -52,7 +53,7 @@ def register_flash_mla_compat(sparse_attention):
     return True
 
 
-def main():
+def main(precision_contexts):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -139,6 +140,17 @@ def main():
     if not native_text:
         shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(model.model.language_model)
         shared_text_kernels["bf16_clamped_mlp_modules"] = install_text_mlp(model.model.language_model)
+    aligned_precision = {}
+    if os.environ.get("TRAIN_INFRA_ALIGNED_PRECISION") == "1":
+        assert native_text and os.environ.get("TRAIN_INFRA_AM_HF_GATED_NORM") != "1"
+        from experiments.train_infra.precision_profile import (
+            automodel_native_core_precision, native_dsa_precision, automodel_moe_reduction_precision,
+        )
+        text = model.model.language_model
+        aligned_precision["core"] = precision_contexts.enter_context(
+            automodel_native_core_precision(text, routed_activation=True, training=True))
+        aligned_precision["dsa"] = precision_contexts.enter_context(native_dsa_precision(text, "automodel", training=True))
+        aligned_precision["moe"] = precision_contexts.enter_context(automodel_moe_reduction_precision(text, training=True))
     gated_norm_fix = []
     if os.environ.get("TRAIN_INFRA_AM_HF_GATED_NORM") == "1":
         assert native_text, "The single-variable gated-norm experiment requires native AM text"
@@ -171,7 +183,8 @@ def main():
         [warmup],
     )
     ce = ChunkedCrossEntropy(chunk_len=1024, reduction="sum")
-    balance_cfg = BalancingLossConfig(**cfg["model_cfg"]["text_config"]["balancing_loss_cfg"])
+    balance_settings = cfg["model_cfg"]["text_config"]["balancing_loss_cfg"]
+    balance_cfg = BalancingLossConfig(**balance_settings) if balance_settings is not None else None
     capture = {"enabled": False, "context": None, "loads": []}
 
     def gate_hook(gate, inputs, kwargs, output):
@@ -188,7 +201,8 @@ def main():
             valid = mask.reshape(-1).bool()
             scores, indices = scores[valid], indices[valid]
         if capture["enabled"]:
-            capture["context"].accumulate(router_weights=scores)
+            if capture["context"] is not None:
+                capture["context"].accumulate(router_weights=scores)
             capture["loads"].append(torch.bincount(indices.reshape(-1), minlength=scores.shape[-1]))
 
     gates = []
@@ -199,10 +213,11 @@ def main():
     assert len(gates) == 3, gates
     manifest = {"reference": str(args.reference), "backend": asdict(backend),
                 "strategy": asdict(strategy), "torch": torch.__version__,
-                "model_class": type(model).__name__, "auxiliary_loss": balance_cfg.model_dump(),
+                "model_class": type(model).__name__, "auxiliary_loss": balance_cfg.model_dump() if balance_cfg else None,
                 "master_dtype": "float32", "reduce_dtype": "bfloat16",
                 "shared_text_kernels": shared_text_kernels,
                 "hf_gated_norm_modules": gated_norm_fix,
+                "aligned_precision": aligned_precision,
                 "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"],
                 "legacy_flash_mla_zero_indexer_adapter": legacy_flash_mla,
                 "vision_attention": {"implementation": "flash_attention_2_varlen",
@@ -231,8 +246,9 @@ def main():
             labels, weights = batch.pop("labels"), batch.pop("loss_weights") / (denominator + 1e-12)
             batch.pop("mm_token_type_ids", None)
             positions = (labels[0] != -100).nonzero().flatten()
-            context = balance_cfg.build()
-            context._batch_size = len(batches)
+            context = balance_cfg.build() if balance_cfg else None
+            if context is not None:
+                context._batch_size = len(batches)
             capture.update(enabled=True, context=context, loads=[])
             print(f"STAGE rank={rank} step={entry['step']} forward", flush=True)
             output = model(logits_to_keep=positions, **batch)
@@ -244,7 +260,7 @@ def main():
             dist.all_reduce(global_loads)
             aux = context.finalize(tokens_per_expert_local=loads, tokens_per_expert_global=global_loads,
                                    n_routed_experts=288, num_experts_per_tok=8,
-                                   non_pad_token=int((~batch["padding_mask"]).sum()))
+                                   non_pad_token=int((~batch["padding_mask"]).sum())) if context is not None else value.new_zeros(())
             with (args.out / f"forward_losses_rank{rank}.jsonl").open("a") as stream:
                 stream.write(json.dumps({"step": entry["step"], "microbatch": index,
                                          "ce_local": float(value.detach()), "balancing_global": float(aux.detach())}) + "\n")
@@ -280,4 +296,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with ExitStack() as precision_contexts:
+        main(precision_contexts)

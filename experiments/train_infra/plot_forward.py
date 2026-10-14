@@ -23,7 +23,7 @@ def errors(x, y):
     return {"shape": list(x.shape), "xtuner_dtype": str(x.dtype), "automodel_dtype": str(y.dtype),
             "bitwise_equal": x.dtype == y.dtype and torch.equal(x, y), "values_equal": torch.equal(xf, yf),
             "max_abs": diff.abs().max().item(),
-            "relative_l2": (diff.norm() / xf.norm().clamp_min(1e-30)).item(),
+            "relative_l2": (diff.norm(dtype=torch.float64) / xf.norm(dtype=torch.float64).clamp_min(1e-30)).item(),
             "unequal_fraction": (x != y).float().mean().item()}
 
 
@@ -72,7 +72,7 @@ def main():
         x, y = a["logits"][0].float(), b["logits"][0].float()
         labels, positions = a["labels"][0].long(), a["positions"].long()
         ce_x, ce_y = F.cross_entropy(x, labels, reduction="none"), F.cross_entropy(y, labels, reduction="none")
-        rel = (y - x).norm(dim=-1) / x.norm(dim=-1).clamp_min(1e-30)
+        rel = (y - x).norm(dim=-1, dtype=torch.float64) / x.norm(dim=-1, dtype=torch.float64).clamp_min(1e-30)
         report["logits_summary"] = {**errors(a["logits"], b["logits"]),
                                     "top1_disagreement": (x.argmax(-1) != y.argmax(-1)).float().mean().item(),
                                     "ce_token_mean_xtuner": ce_x.mean().item(), "ce_token_mean_automodel": ce_y.mean().item()}

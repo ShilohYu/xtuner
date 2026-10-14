@@ -15,3 +15,11 @@ def test_token_statistics_use_mean_and_interpolated_median():
     })
     with pytest.raises(AssertionError):
         relative_error_statistics(torch.tensor([float("nan")]))
+
+
+def test_forward_l2_uses_fp64_reduction():
+    from experiments.train_infra.plot_forward import errors
+
+    # FP32 squared-norm accumulation overflows although the relative error is finite.
+    x = torch.full((1, 3, 4), 1e20)
+    assert errors(x, x * 0.5)["relative_l2"] == pytest.approx(0.5)

@@ -54,7 +54,9 @@ def capture_logits(model, backend, out, completed_updates):
                     "backend": backend, "completed_updates": completed_updates, "fixture": fixture_path,
                     "input_hashes": {k: tensor_hash(v) for k, v in fixture.items()},
                     "training": model.training, "logits_dtype": str(logits.dtype),
-                    "native_automodel_text": os.environ.get("TRAIN_INFRA_NATIVE_TEXT") == "1",
+                    "native_automodel_text": os.environ.get("TRAIN_INFRA_NATIVE_TEXT") == "1" and os.environ.get("TRAIN_INFRA_ALIGNED_PRECISION") != "1",
+                    "aligned_precision": os.environ.get("TRAIN_INFRA_ALIGNED_PRECISION") == "1",
+                    "permute_compute_dtype": os.environ.get("PERMUTE_COMPUTE_DTYPE"),
                     "xtuner_hf_norm": os.environ.get("TRAIN_INFRA_XTUNER_HF_NORM") == "1",
                 }, indent=2))
     finally:

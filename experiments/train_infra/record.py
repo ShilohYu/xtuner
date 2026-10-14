@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -41,7 +42,7 @@ def recording_collator(instances, **kwargs):
     return batches
 
 
-def install():
+def install(precision_contexts):
     from xtuner.v1.datasets import config as data_config
     from xtuner.v1.datasets.vlm_jsonl import VLMJsonlDataset
     from xtuner.v1.engine.train_engine import TrainEngine
@@ -62,6 +63,11 @@ def install():
             from experiments.train_infra.text_attention import install_xtuner_hf_rms_norm
             count = install_xtuner_hf_rms_norm(model.language_model)
             (out / f"norm_adapter_rank{dist.get_rank()}.json").write_text(json.dumps({"modules": count}))
+        if os.environ.get("TRAIN_INFRA_ALIGNED_PRECISION") == "1":
+            assert os.environ.get("TRAIN_INFRA_XTUNER_HF_NORM") != "1"
+            from experiments.train_infra.precision_profile import native_dsa_precision
+            profile = precision_contexts.enter_context(native_dsa_precision(model.language_model, "xtuner", training=True))
+            (out / f"precision_profile_rank{dist.get_rank()}.json").write_text(json.dumps(profile, indent=2))
         return model
 
     def prepare_record(self, batches):
@@ -149,7 +155,8 @@ def install():
 
 
 if __name__ == "__main__":
-    install()
-    from xtuner.v1.train.cli.sft import app
+    with ExitStack() as precision_contexts:
+        install(precision_contexts)
+        from xtuner.v1.train.cli.sft import app
 
-    app(exit_on_error=False)
+        app(exit_on_error=False)

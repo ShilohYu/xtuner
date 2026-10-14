@@ -34,6 +34,7 @@ def main():
     assert len(statuses) == 2 and all(s["optimizer_gate_passed"] for s in statuses), statuses
     am_environment = json.loads((args.runs / "automodel_e2e" / "environment_rank0.json").read_text())
     am_label = "AM + HF gated RMSNorm" if am_environment.get("hf_gated_norm_modules") else "native AM text"
+    profile_label = "Aligned precision profile (training validation)" if am_environment.get("aligned_precision") else f"{am_label} / XT HF RMSNorm"
     steps = {s["expected_steps"] for s in statuses}
     assert len(steps) == 1
     total = steps.pop()
@@ -55,7 +56,10 @@ def main():
         summary = errors(a["logits"], b["logits"])
         x, y = a["logits"][0].float(), b["logits"][0].float()
         positions, labels = a["positions"], a["labels"][0]
-        rel = (y - x).norm(dim=-1) / x.norm(dim=-1).clamp_min(1e-30)
+        rel = torch.cat([
+            (v.double() - u.double()).norm(dim=-1) / u.double().norm(dim=-1).clamp_min(1e-30)
+            for u, v in zip(x.split(32), y.split(32))
+        ])
         cx, cy = (F.cross_entropy(z, labels, reduction="none") for z in (x, y))
         summary.update(completed_updates=updates, top1_disagreement=float((x.argmax(-1) != y.argmax(-1)).float().mean()),
                        ce_token_mean_xtuner=float(cx.mean()), ce_token_mean_automodel=float(cy.mean()))
@@ -79,7 +83,7 @@ def main():
     axes[1, 1].set(xlabel="Completed optimizer updates", ylabel="Error (%)", xticks=[0,total])
     for ax in axes.flat:
         ax.legend(fontsize=8)
-    fig.suptitle(f"Fixed 8K pack before/after {total} real training steps; {am_label} / XT HF RMSNorm")
+    fig.suptitle(f"Fixed 8K pack before/after {total} real training steps; {profile_label}")
     fig.savefig(args.out / "logits_before_after_training.png", dpi=180)
     with (args.out / "fixed_pack_token_errors.csv").open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
@@ -110,7 +114,7 @@ def main():
     for panel in panels:
         panel.legend(fontsize=9)
         panel.grid(alpha=0.2)
-    overview.suptitle(f"{total} optimizer steps | GLM-5.3-Flash 4 layers, 8 GPUs, 8K | frozen ViT/projector, compile off\n{am_label} / XT HF RMSNorm")
+    overview.suptitle(f"{total} optimizer steps | GLM-5.3-Flash 4 layers, 8 GPUs, 8K | frozen ViT/projector, compile off\n{profile_label}")
     overview.savefig(args.out / "loss_logits_grad_norm.png", dpi=180)
     print(json.dumps(reports, indent=2))
 

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import subprocess
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -13,7 +14,7 @@ from safetensors.torch import load_file, save_file
 from experiments.train_infra.record import tensor_hash
 
 
-def main():
+def main(precision_contexts):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=["xtuner", "automodel"], required=True)
     parser.add_argument("--fixture", type=Path, required=True)
@@ -21,7 +22,23 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--native-text", action="store_true", help="Keep native AutoModel text operators")
     parser.add_argument("--xtuner-hf-norm", action="store_true", help="Test HF RMSNorm precision on XTuner only")
+    parser.add_argument("--native-core-precision", action="store_true",
+                        help="Align AM precision primitives and metadata to XT, retaining native attention cores")
+    parser.add_argument("--dsa-precision", action="store_true",
+                        help="Forward-only DSA geometry/scoring/order diagnostic; alters both backends")
+    parser.add_argument("--routed-activation-precision", action="store_true",
+                        help="Use XT BF16 SwiGLU in native AM routed experts; forward-only diagnostic")
+    parser.add_argument("--moe-reduction-precision", action="store_true",
+                        help="Sort native AM routing and recombine own expert outputs with native XT FP32")
     args = parser.parse_args()
+    if args.native_core_precision and (args.backend != "automodel" or not args.native_text):
+        parser.error("--native-core-precision requires --backend automodel --native-text")
+    if args.dsa_precision and args.backend == "automodel" and not args.native_core_precision:
+        parser.error("AM --dsa-precision requires --native-core-precision")
+    if args.routed_activation_precision and not args.native_core_precision:
+        parser.error("--routed-activation-precision requires --native-core-precision")
+    if args.moe_reduction_precision and not args.routed_activation_precision:
+        parser.error("--moe-reduction-precision requires --routed-activation-precision")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -85,12 +102,17 @@ def main():
         from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config
         from nemo_automodel.components.distributed.mesh import ParallelismSizes
         from nemo_automodel.components.models.common import BackendConfig, cudnn_sparse_attention
-        from nemo_automodel.components.models.glm5_next import vision as native_vision
         from nemo_automodel.components.models.glm5_next import layers as native_layers
+        from nemo_automodel.components.models.glm5_next import vision as native_vision
         from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
-        from experiments.train_infra.run_automodel import register_glm_layers, register_flash_mla_compat
+
+        from experiments.train_infra.run_automodel import register_flash_mla_compat, register_glm_layers
+        from experiments.train_infra.text_attention import (
+            install_shared_text_kernels,
+            install_text_mlp,
+            install_text_rms_norm,
+        )
         from experiments.train_infra.vision_attention import install_flash_attention_2
-        from experiments.train_infra.text_attention import install_shared_text_kernels, install_text_rms_norm, install_text_mlp
 
         native_checkpoint = activation_checkpointing.checkpoint_wrapper
 
@@ -127,6 +149,10 @@ def main():
         groups = parallelizer.get_model_layer_groups(model)
         assert len(groups["language"]) == 4 and len(groups["vision"]) == 24
         vision, projector, text = model.model.visual, None, model.model.language_model
+        if args.native_core_precision:
+            from experiments.train_infra.precision_profile import automodel_native_core_precision
+            shared_text_kernels = precision_contexts.enter_context(
+                automodel_native_core_precision(text, routed_activation=args.routed_activation_precision))
         if not args.native_text:
             shared_text_kernels["rms_norm_modules"] = install_text_rms_norm(text)
             shared_text_kernels["bf16_clamped_mlp_modules"] = install_text_mlp(text)
@@ -138,6 +164,14 @@ def main():
                 padding_mask=batch["padding_mask"], logits_to_keep=positions,
             ).logits.detach().cpu().contiguous()
 
+    dsa_precision = None
+    moe_reduction_precision = None
+    if args.moe_reduction_precision:
+        from experiments.train_infra.precision_profile import automodel_moe_reduction_precision
+        moe_reduction_precision = precision_contexts.enter_context(automodel_moe_reduction_precision(text))
+    if args.dsa_precision:
+        from experiments.train_infra.precision_profile import native_dsa_precision
+        dsa_precision = precision_contexts.enter_context(native_dsa_precision(text, args.backend))
     model.train()
     vision.requires_grad_(False)
     if projector is not None:
@@ -250,7 +284,11 @@ def main():
                     "training": True, "freeze_vision_and_projector": True, "compile": False,
                     "cast_forward_inputs": False,
                     "shared_text_kernels": shared_text_kernels if args.backend == "automodel" else "native XTuner",
-                    "native_automodel_text": args.native_text,
+                    "native_automodel_text": args.native_text and not args.native_core_precision,
+                    "native_core_precision": args.native_core_precision,
+                    "permute_compute_dtype_env": os.environ.get("PERMUTE_COMPUTE_DTYPE"),
+                    "dsa_precision": dsa_precision,
+                    "moe_reduction_precision": moe_reduction_precision,
                     "xtuner_hf_norm_modules": xtuner_hf_norm_modules if args.backend == "xtuner" else 0,
                     "no_grad": True, "world": 8, "ep": 1, "sp": 1, "optimizer_steps": 0,
                     "observation_preserves_logits": True, "router_bias_unchanged": True,
@@ -263,4 +301,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with ExitStack() as precision_contexts:
+        main(precision_contexts)
