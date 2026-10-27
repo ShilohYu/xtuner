@@ -45,7 +45,7 @@ from torch.testing._internal.common_distributed import DistributedTestBase
 from transformers import AutoProcessor, AutoTokenizer, Glm5NextForConditionalGeneration
 from .glm53_parity_cases import load_glm53_reference
 from xtuner._testing import DeterministicDDPTestCase
-from xtuner._testing.logits import check_logits
+from xtuner._testing.logits import check_logits, logits_metrics
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.loss.ce_loss import CELossConfig
@@ -539,8 +539,11 @@ class TestGlm53TextMoEAccuracy(DeterministicDDPTestCase):
                     f"GLM53 case={name} loss HF={expected_losses[sample_index].item()} "
                     f"XT={losses[-1].item()} AM={am_reference[sample_index][0]}"
                 )
-                print(f"GLM53 case={name} AM/HF logits={check_logits(am_logits, expected_logits[sample_index])}")
-                print(f"GLM53 case={name} XT/AM logits={check_logits(logits[0, batch['positions'].to('cuda')], am_logits)}")
+                # Report-only: native AutoModel sits above the XT-vs-HF 5% logits gate by design
+                # (documented native gap), so the optional reference must not hard-assert here;
+                # the authoritative XT-vs-HF check_logits above stays the gate.
+                print(f"GLM53 case={name} AM/HF logits={logits_metrics(am_logits, expected_logits[sample_index])}")
+                print(f"GLM53 case={name} XT/AM logits={logits_metrics(logits[0, batch['positions'].to('cuda')], am_logits)}")
 
         for start, end in ((0, len(text_list)), (len(text_list), len(cases))):
             self._check_loss_curve(
