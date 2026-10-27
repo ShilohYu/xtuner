@@ -27,9 +27,17 @@ from transformers.models.glm5_next import modeling_glm5_next as hf_code
 from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig as HFConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model.moe.glm53 import Glm53TextMoEConfig
-from xtuner.v1.model.moe.glm53.glm53 import _glm53_rms_norm
 from xtuner.v1.module.rms_norm import RMSNorm
 from xtuner.v1.ops.sparse_mla.kpool import torch_kpool_topk_indices
+
+
+def _glm53_rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
+    # Diagnostic-only intervention for the XT side of the three-way comparison: HF rounds the
+    # normalized states to the input dtype before the affine multiply, while XT production keeps
+    # its native late rounding, so the override lives here instead of the model code.
+    states = x.float()
+    normalized = states * torch.rsqrt(states.square().mean(-1, keepdim=True) + epsilon)
+    return weight * normalized.to(x.dtype)
 
 
 def canonical_ids(ids, width, offset=0):
