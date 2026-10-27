@@ -30,6 +30,8 @@ TestNoPEDSAMLAConfigValidatesAssignment
 import gc
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import parametrize
@@ -41,6 +43,7 @@ from torch.distributed.tensor import DTensor
 from torch.testing._internal.common_distributed import DistributedTestBase
 
 from transformers import AutoProcessor, AutoTokenizer, Glm5NextForConditionalGeneration
+from .glm53_parity_cases import load_glm53_reference
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner._testing.logits import check_logits
 from xtuner.v1.config import FSDPConfig
@@ -357,6 +360,35 @@ class TestGlm53TextMoEWeightMapping:
         torch.cuda.empty_cache()
 
 
+@pytest.fixture(scope="class")
+def automodel_reference(tmp_path_factory):
+    """Finish the optional AM process before the existing test starts GPU workers."""
+    python = os.environ.get("GLM53_AUTOMODEL_PYTHON")
+    if not python or not os.path.isdir(GLM_5_3_FLASH_PATH):
+        yield
+        return
+    output = tmp_path_factory.mktemp("glm53-automodel") / "reference"
+    subprocess.run(
+        [
+            python,
+            str(Path(__file__).with_name("run_glm53_reference.py")),
+            "--checkpoint",
+            GLM_5_3_FLASH_PATH,
+            "--processor-python",
+            sys.executable,
+            "--output",
+            str(output),
+        ],
+        check=True,
+        timeout=1800,
+    )
+    # Workers inherit this internal result path; callers only select an interpreter.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("_GLM53_AUTOMODEL_REFERENCE", str(output))
+        yield
+
+
+@pytest.mark.usefixtures("automodel_reference")
 class TestGlm53TextMoEAccuracy(DeterministicDDPTestCase):
     """验收 1: text + image compose-model forward loss/logits vs real `transformers.Glm5NextForConditionalGeneration`
     on the F0 25B cropped checkpoint (GLM_5_3_FLASH_PATH).
@@ -436,6 +468,10 @@ class TestGlm53TextMoEAccuracy(DeterministicDDPTestCase):
                 batch["labels"][batch["mm_token_type_ids"] != 0] = -100
             batch["positions"] = torch.nonzero(batch["labels"][0, 1:] != -100).flatten()[-8:]
             assert batch["positions"].numel() > 0
+        # Optional AutoModel reference: contract-checked offline predictions from
+        # run_glm53_reference.py (see the automodel_reference fixture above).
+        am_reference_dir = os.environ.get("_GLM53_AUTOMODEL_REFERENCE")
+        am_reference = load_glm53_reference(am_reference_dir, cases, GLM_5_3_FLASH_PATH) if am_reference_dir else None
         hf_model.eval()
         expected_losses = []
         expected_logits = []
@@ -497,6 +533,14 @@ class TestGlm53TextMoEAccuracy(DeterministicDDPTestCase):
                 logits = model(seq_ctx=seq_ctx, loss_ctx=None).logits
             metrics = check_logits(logits[0, batch["positions"].to("cuda")], expected_logits[sample_index])
             print(f"GLM53 case={name} logits={metrics}", flush=True)
+            if am_reference is not None:
+                am_logits = am_reference[sample_index][1]
+                print(
+                    f"GLM53 case={name} loss HF={expected_losses[sample_index].item()} "
+                    f"XT={losses[-1].item()} AM={am_reference[sample_index][0]}"
+                )
+                print(f"GLM53 case={name} AM/HF logits={check_logits(am_logits, expected_logits[sample_index])}")
+                print(f"GLM53 case={name} XT/AM logits={check_logits(logits[0, batch['positions'].to('cuda')], am_logits)}")
 
         for start, end in ((0, len(text_list)), (len(text_list), len(cases))):
             self._check_loss_curve(
@@ -505,6 +549,13 @@ class TestGlm53TextMoEAccuracy(DeterministicDDPTestCase):
                 sim_tol=3e-2,
                 rtol=3e-2,
             )
+            if am_reference is not None:
+                am_losses = torch.tensor([item[0] for item in am_reference[start:end]])
+                for actual, reference in (
+                    (am_losses, torch.tensor(expected_losses[start:end])),
+                    (torch.tensor(losses[start:end]), am_losses),
+                ):
+                    self._check_loss_curve(losses=actual, losses_ref=reference, sim_tol=3e-2, rtol=3e-2)
 
     @property
     def world_size(self) -> int:
