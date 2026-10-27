@@ -14,9 +14,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from experiments.train_infra.replay import Replay
+from xtuner.v1.utils.profile import timer
 
 
-def register_glm_layers(parallelizer, model_class):
+def register_glm_layers(parallelizer, model_class, *, conv_fp32=False):
     native_layer_specs = parallelizer._get_model_layer_group_specs
 
     def matching_layer_specs():
@@ -33,6 +34,8 @@ def register_glm_layers(parallelizer, model_class):
     class GlmPrecisionStrategy(parallelizer.DefaultParallelizationStrategy):
         # EP1's generic path otherwise casts the native FP32 holders to BF16.
         _fp32_compute_module_names = tuple(model_class._keep_in_fp32_modules_strict)
+        if conv_fp32:
+            _fp32_compute_module_names += ("q_conv1d", "k_conv1d", "v_conv1d")
         _apply_fsdp_sharding = parallelizer.Qwen3_5ParallelizationStrategy._apply_fsdp_sharding
 
     for name in (model_class.__name__, f"FSDP{model_class.__name__}"):
@@ -88,7 +91,7 @@ def main(precision_contexts):
     from experiments.train_infra.vision_attention import install_flash_attention_2
     from experiments.train_infra.text_attention import install_shared_text_kernels, install_text_rms_norm, install_text_mlp
     from nemo_automodel.components.training.utils import (
-        prepare_for_final_backward, prepare_for_grad_accumulation, scale_grads_and_clip_grad_norm,
+        prepare_for_final_backward, prepare_for_grad_accumulation,
     )
     from xtuner.v1.loss.moe_loss import BalancingLossConfig
 
@@ -102,10 +105,17 @@ def main(precision_contexts):
 
     activation_checkpointing.checkpoint_wrapper = matching_checkpoint_wrapper
     parallelizer.checkpoint_wrapper = matching_checkpoint_wrapper
-    register_glm_layers(parallelizer, Glm5NextForConditionalGeneration)
+    conv_fp32 = os.environ.get("TRAIN_INFRA_ALIGNED_PRECISION") == "1"
+    register_glm_layers(parallelizer, Glm5NextForConditionalGeneration, conv_fp32=conv_fp32)
+    conv_precision = {}
+    if conv_fp32:
+        from experiments.train_infra.conv_precision import automodel_conv_precision
+        conv_precision = precision_contexts.enter_context(automodel_conv_precision())
     legacy_flash_mla = register_flash_mla_compat(cudnn_sparse_attention)
     assert os.environ.get("XTUNER_USE_FA3", "0") == "0", "Reference ViT uses FlashAttention 2"
-    assert os.environ.get("XTUNER_DETERMINISTIC", "false") != "true"
+    assert cfg["model_cfg"].get("freeze_vision") or os.environ.get("XTUNER_DETERMINISTIC", "false") != "true", (
+        "Fixed Triton configuration currently requires frozen vision; the AM vision adapter uses nondeterministic FA2 backward"
+    )
     install_flash_attention_2(vision, flash_attn_varlen_func)
     native_text = os.environ.get("TRAIN_INFRA_NATIVE_TEXT") == "1"
     shared_text_kernels = {"mode": "native AutoModel"} if native_text else install_shared_text_kernels(layers)
@@ -171,15 +181,18 @@ def main(precision_contexts):
         assert checkpoint_counts.get("vision", 0) >= 48, checkpoint_counts
     parameters = [p for p in model.parameters() if p.requires_grad]
     assert all(p.dtype == torch.float32 for p in parameters), "FP32 master weights required"
-    optimizer = torch.optim.AdamW(parameters, lr=2e-5, betas=(0.9, 0.95), eps=1e-8,
-                                 weight_decay=0.05, foreach=False)
+    from experiments.train_infra.muon_alignment import build_muon, clip_muon_gradients, optimizer_manifest
+
+    optimizer = build_muon(model, cfg["optim_cfg"])
+    (args.out / f"optimizer_groups_rank{rank}.json").write_text(json.dumps(optimizer_manifest(optimizer), indent=2))
     total = cfg["total_step"]
     assert total is not None, "This gate uses the explicit reference step schedule"
-    warmup = int(total * 0.1)
+    warmup_setting = cfg["lr_cfg"]["warmup_ratio"]
+    warmup = int(total * warmup_setting) if warmup_setting < 1 else int(warmup_setting)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
         [torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: step / warmup if step < warmup else 1),
-         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, total - warmup, eta_min=1e-6)],
+         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, total - warmup, eta_min=cfg["lr_cfg"]["lr_min"])],
         [warmup],
     )
     ce = ChunkedCrossEntropy(chunk_len=1024, reduction="sum")
@@ -218,6 +231,7 @@ def main(precision_contexts):
                 "shared_text_kernels": shared_text_kernels,
                 "hf_gated_norm_modules": gated_norm_fix,
                 "aligned_precision": aligned_precision,
+                "conv_precision": conv_precision,
                 "checkpoint_preserve_rng_state": cfg["fsdp_cfg"]["checkpoint_preserve_rng_state"],
                 "legacy_flash_mla_zero_indexer_adapter": legacy_flash_mla,
                 "vision_attention": {"implementation": "flash_attention_2_varlen",
@@ -231,62 +245,85 @@ def main(precision_contexts):
         from experiments.train_infra.training_logits import capture_logits
         capture_logits(model, "automodel", args.out, 0)
     for entry in replay.entries:
-        torch.cuda.reset_peak_memory_stats()
+        gradients = None
+        if os.environ.get("TRAIN_INFRA_GRAD_DIAGNOSTIC") == "1":
+            from experiments.train_infra.gradient_diagnostic import BoundaryGradients
+            gradients = BoundaryGradients(model, "automodel", args.out, entry["step"])
         print(f"STAGE rank={rank} step={entry['step']} replay_inputs", flush=True)
         batches = replay.batches(entry)
-        denominator = sum(batch["loss_weights"].sum() for batch in batches).cuda()
-        dist.all_reduce(denominator)
-        prepare_for_grad_accumulation([model])
-        local_ce = torch.zeros((), device="cuda")
-        local_aux = torch.zeros((), device="cuda")
-        for index, batch in enumerate(batches):
-            if index == len(batches) - 1:
-                prepare_for_final_backward([model])
-            batch = {key: tensor.cuda() for key, tensor in batch.items()}
-            labels, weights = batch.pop("labels"), batch.pop("loss_weights") / (denominator + 1e-12)
-            batch.pop("mm_token_type_ids", None)
-            positions = (labels[0] != -100).nonzero().flatten()
-            context = balance_cfg.build() if balance_cfg else None
-            if context is not None:
-                context._batch_size = len(batches)
-            capture.update(enabled=True, context=context, loads=[])
-            print(f"STAGE rank={rank} step={entry['step']} forward", flush=True)
-            output = model(logits_to_keep=positions, **batch)
-            capture["enabled"] = False
-            value = ce(output.logits, labels[:, positions], loss_weights=weights[:, positions])
-            assert capture["loads"], "Native MoE gate capture did not run"
-            loads = torch.stack(capture["loads"])
-            global_loads = loads.clone()
-            dist.all_reduce(global_loads)
-            aux = context.finalize(tokens_per_expert_local=loads, tokens_per_expert_global=global_loads,
-                                   n_routed_experts=288, num_experts_per_tok=8,
-                                   non_pad_token=int((~batch["padding_mask"]).sum())) if context is not None else value.new_zeros(())
-            with (args.out / f"forward_losses_rank{rank}.jsonl").open("a") as stream:
-                stream.write(json.dumps({"step": entry["step"], "microbatch": index,
-                                         "ce_local": float(value.detach()), "balancing_global": float(aux.detach())}) + "\n")
-            print(f"STAGE rank={rank} step={entry['step']} backward", flush=True)
-            (value * dist.get_world_size() + aux).backward()
-            local_ce += value.detach()
-            local_aux += aux.detach()
-        dist.all_reduce(local_ce)
-        norm = scale_grads_and_clip_grad_norm(1.0, [model], device_mesh=setup.mesh_context.device_mesh,
-                                              foreach=False, dp_group_size=8)
-        assert torch.isfinite(norm) and torch.isfinite(local_ce)
-        name, probe = next((name, p) for name, p in model.named_parameters()
-                           if p.requires_grad and p.dtype == torch.float32 and p.numel() <= 16384)
-        local = probe.to_local() if hasattr(probe, "to_local") else probe
-        before = local.detach().clone()
-        lr = optimizer.param_groups[0]["lr"]
-        print(f"STAGE rank={rank} step={entry['step']} optimizer lr={lr}", flush=True)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        model.update_moe_gate_bias()
-        scheduler.step()
+        train_tokens = sum(int((~batch["padding_mask"]).sum()) for batch in batches)
+        train_padded_tokens = sum(batch["input_ids"].numel() for batch in batches)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        timing = {}
+        with timer("train_step_seconds", timing):
+            denominator = sum(batch["loss_weights"].sum() for batch in batches).cuda()
+            dist.all_reduce(denominator)
+            prepare_for_grad_accumulation([model])
+            local_ce = torch.zeros((), device="cuda")
+            local_aux = torch.zeros((), device="cuda")
+            for index, batch in enumerate(batches):
+                if index == len(batches) - 1:
+                    prepare_for_final_backward([model])
+                batch = {key: tensor.cuda() for key, tensor in batch.items()}
+                labels, weights = batch.pop("labels"), batch.pop("loss_weights") / (denominator + 1e-12)
+                if gradients is not None and rank == 0:
+                    from safetensors.torch import save_file
+                    assert len(batches) == 1, "Single-sample diagnostic only"
+                    target = args.out / "loss_inputs"
+                    target.mkdir(exist_ok=True)
+                    save_file({"labels": labels.cpu().contiguous(), "weights": weights.cpu().contiguous()},
+                              str(target / f"step_{entry['step']:03d}.safetensors"))
+                batch.pop("mm_token_type_ids", None)
+                positions = (labels[0] != -100).nonzero().flatten()
+                context = balance_cfg.build() if balance_cfg else None
+                if context is not None:
+                    context._batch_size = len(batches)
+                capture.update(enabled=True, context=context, loads=[])
+                print(f"STAGE rank={rank} step={entry['step']} forward", flush=True)
+                output = model(logits_to_keep=positions, **batch)
+                capture["enabled"] = False
+                value = ce(output.logits, labels[:, positions], loss_weights=weights[:, positions])
+                assert capture["loads"], "Native MoE gate capture did not run"
+                loads = torch.stack(capture["loads"])
+                global_loads = loads.clone()
+                dist.all_reduce(global_loads)
+                aux = context.finalize(tokens_per_expert_local=loads, tokens_per_expert_global=global_loads,
+                                       n_routed_experts=288, num_experts_per_tok=8,
+                                       non_pad_token=int((~batch["padding_mask"]).sum())) if context is not None else value.new_zeros(())
+                with (args.out / f"forward_losses_rank{rank}.jsonl").open("a") as stream:
+                    stream.write(json.dumps({"step": entry["step"], "microbatch": index,
+                                             "ce_local": float(value.detach()), "balancing_global": float(aux.detach())}) + "\n")
+                print(f"STAGE rank={rank} step={entry['step']} backward", flush=True)
+                (value * dist.get_world_size() + aux).backward()
+                local_ce += value.detach()
+                local_aux += aux.detach()
+            if gradients is not None:
+                gradients.close()
+            dist.all_reduce(local_ce)
+            norm = clip_muon_gradients(optimizer, model, cfg["optim_cfg"]["max_grad_norm"])
+            assert torch.isfinite(norm) and torch.isfinite(local_ce)
+            name, probe = next((name, p) for name, p in model.named_parameters()
+                               if p.requires_grad and p.dtype == torch.float32 and p.numel() <= 16384)
+            local = probe.to_local() if hasattr(probe, "to_local") else probe
+            before = local.detach().clone()
+            lr = optimizer.param_groups[0]["lr"]
+            print(f"STAGE rank={rank} step={entry['step']} optimizer lr={lr}", flush=True)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            model.update_moe_gate_bias()
+            scheduler.step()
+            torch.cuda.synchronize()
         row = {"step": entry["step"], "loss": float(local_ce + local_aux),
                "ce_loss": float(local_ce), "balancing_loss": float(local_aux),
                "grad_norm": float(norm), "lr": lr, "probe": name,
                "update_max_abs": float((local.detach() - before).abs().max()),
-               "peak_memory_bytes": torch.cuda.max_memory_allocated()}
+               "peak_memory_bytes": torch.cuda.max_memory_allocated(),
+               "peak_reserved_memory_bytes": torch.cuda.max_memory_reserved(),
+               **timing, "train_tokens": train_tokens, "train_padded_tokens": train_padded_tokens,
+               "train_tgs_local": train_tokens / timing["train_step_seconds"],
+               "gradient_diagnostic_enabled": gradients is not None,
+               "timing_scope": "prepared_cpu_pack_through_optimizer; excludes_extra_logits"}
         with (args.out / f"metrics_rank{rank}.jsonl").open("a") as stream:
             stream.write(json.dumps(row) + "\n")
         del batches, batch, output, context

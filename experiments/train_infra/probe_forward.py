@@ -48,6 +48,9 @@ def main(precision_contexts):
     cfg = json.loads((args.reference / "resolved_config.json").read_text())
     fixture = load_file(str(args.fixture))
     batch = {k: v.cuda() for k, v in fixture.items()}
+    media = {key: batch[key] for key in ("pixel_values", "image_grid_thw") if key in batch}
+    if "pixel_values" in media:
+        media["pixel_values"] = media["pixel_values"].bfloat16()
     positions = (batch["labels"][0] != -100).nonzero().flatten()
     assert positions.numel() > 0
     print(f"STAGE rank={rank} load_{args.backend}", flush=True)
@@ -84,8 +87,8 @@ def main(precision_contexts):
         context = SequenceContext(
             input_ids=batch["input_ids"], cu_seq_lens_q=cu, cu_seq_lens_k=cu,
             max_length_q=maximum, max_length_k=maximum, device="cuda",
-            num_padding=int(batch["padding_mask"].sum()), pixel_values=batch["pixel_values"].bfloat16(),
-            image_grid_thw=batch["image_grid_thw"], mm_token_type_ids=batch["mm_token_type_ids"],
+            num_padding=int(batch["padding_mask"].sum()), **media,
+            mm_token_type_ids=batch["mm_token_type_ids"],
         )
 
         def forward():
@@ -159,8 +162,7 @@ def main(precision_contexts):
 
         def forward():
             return model(
-                input_ids=batch["input_ids"], pixel_values=batch["pixel_values"].bfloat16(),
-                image_grid_thw=batch["image_grid_thw"], cu_seqlens=batch["cu_seqlens"],
+                input_ids=batch["input_ids"], **media, cu_seqlens=batch["cu_seqlens"],
                 padding_mask=batch["padding_mask"], logits_to_keep=positions,
             ).logits.detach().cpu().contiguous()
 
@@ -293,7 +295,7 @@ def main(precision_contexts):
                     "no_grad": True, "world": 8, "ep": 1, "sp": 1, "optimizer_steps": 0,
                     "observation_preserves_logits": True, "router_bias_unchanged": True,
                     "experiment_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-                    "diagnostic": "Common rank0 step0 full 8K pack repeated on all ranks; no training acceptance"}
+                    "diagnostic": "Common fixed fixture repeated on all ranks; no training acceptance"}
         (args.out / "metadata.json").write_text(json.dumps(metadata, indent=2))
         print(json.dumps({"out": str(args.out), "logits": list(logits.shape)}), flush=True)
     dist.barrier()

@@ -13,6 +13,24 @@ def optimizer_steps_complete(rank_rows, expected_steps):
     )
 
 
+def performance_rows(metrics):
+    """EP1/SP1: tokens/GPU/s from all ranks and the slowest rank's native timer."""
+    rows = []
+    required = {"train_step_seconds", "train_tokens", "peak_memory_bytes", "peak_reserved_memory_bytes"}
+    for run, step in sorted({(r["run"], r["step"]) for r in metrics}):
+        ranks = [r for r in metrics if (r["run"], r["step"]) == (run, step)]
+        if not all(required <= r.keys() for r in ranks):
+            continue  # Historical runs without timers have no measured throughput.
+        assert len(ranks) == 8 and {r["rank"] for r in ranks} == set(range(8))
+        seconds = max(r["train_step_seconds"] for r in ranks)
+        assert math.isfinite(seconds) and seconds > 0
+        rows.append({"run": run, "step": step, "train_step_seconds": seconds,
+                     "tgs": sum(r["train_tokens"] for r in ranks) / (8 * seconds),
+                     "allocated_gib": max(r["peak_memory_bytes"] for r in ranks) / 1024**3,
+                     "reserved_gib": max(r["peak_reserved_memory_bytes"] for r in ranks) / 1024**3})
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=Path, required=True)
@@ -81,6 +99,7 @@ def main():
         statuses.append(status)
     columns = ["run", "rank", "step", "loss", "ce_loss", "balancing_loss", "grad_norm", "lr",
                "probe", "update_max_abs", "peak_memory_bytes"]
+    columns += sorted({key for row in metrics for key in row} - set(columns))
     with (args.out / "optimizer_metrics.csv").open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
@@ -123,6 +142,32 @@ def main():
         for key, (single_figure, ax) in individual.items():
             ax.set_title("Recorded optimizer steps; dashed line marks incomplete runs")
             single_figure.savefig(args.out / f"{key}.png", dpi=180)
+        performance = performance_rows(metrics)
+        (args.out / "performance.json").write_text(json.dumps({
+            "scope": "EP1/SP1; native train timer excludes extra logits; includes enabled gradient diagnostics",
+            "status": "measured" if performance else "missing native timer records",
+            "rows": performance}, indent=2))
+        if performance:
+            with (args.out / "performance.csv").open("w") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(performance[0]))
+                writer.writeheader()
+                writer.writerows(performance)
+            figure, axes = plt.subplots(1, 2, figsize=(12, 4), layout="constrained")
+            for run in sorted({r["run"] for r in performance}):
+                trace = [r for r in performance if r["run"] == run]
+                steps = [r["step"] for r in trace]
+                axes[0].plot(steps, [r["tgs"] for r in trace], marker="o", label=run)
+                line, = axes[1].plot(steps, [r["allocated_gib"] for r in trace], marker="o", label=f"{run} allocated")
+                axes[1].plot(steps, [r["reserved_gib"] for r in trace], marker="o", linestyle="--",
+                             color=line.get_color(), label=f"{run} reserved")
+            axes[0].set(ylabel="Valid input tokens / GPU / second", title="TGS (slowest rank timer)")
+            axes[1].set(ylabel="Peak memory across ranks (GiB)", title="Training allocated / reserved memory")
+            for axis in axes:
+                axis.set_xlabel("Optimizer step (0 includes startup / warmup)")
+                axis.legend(fontsize=7)
+                axis.grid(alpha=0.2)
+            figure.suptitle("Diagnostic run; excludes extra logits observation; not production throughput")
+            figure.savefig(args.out / "tgs_memory.png", dpi=180)
     print(json.dumps(statuses, indent=2))
 
 

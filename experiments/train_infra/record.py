@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 from xtuner.v1.datasets.collator import glm53_vl_sft_collator as native_collator
+from xtuner.v1.utils.profile import timer
 
 
 def tensor_hash(tensor):
@@ -50,6 +51,9 @@ def install(precision_contexts):
 
     VLMJsonlDataset.__getitem__ = strict_getitem
     data_config.glm53_vl_sft_collator = recording_collator
+    if os.environ.get("TRAIN_INFRA_FIXED_SAMPLE"):
+        from experiments.train_infra.minimal_samples import fixed_dataloader
+        data_config.DataloaderConfig.build = fixed_dataloader
     out = Path(os.environ["WORK_DIR"])
     prepare = Trainer._prepare_model_input
     clip = TrainEngine.clip_grad_norm
@@ -88,13 +92,41 @@ def install(precision_contexts):
         with (out / f"inputs_rank{rank}.jsonl").open("a") as stream:
             stream.write(json.dumps({"step": step, "batches": records}) + "\n")
         print(f"INPUT_RECORDED rank={rank} step={step}", flush=True)
-        return prepare(self, batches)
+        self._engine._experiment_tokens = sum(
+            batch["seq_ctx"].input_ids.numel() - batch["seq_ctx"].num_padding for batch in batches
+        )
+        self._engine._experiment_padded_tokens = sum(batch["seq_ctx"].input_ids.numel() for batch in batches)
+        # Both backends time prepared CPU packs through optimizer completion; exclude logits observation.
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        self._engine._experiment_timing = {}
+        self._engine._experiment_timer = timer("train_step_seconds", self._engine._experiment_timing)
+        self._engine._experiment_timer.__enter__()
+        result = prepare(self, batches)
+        if os.environ.get("TRAIN_INFRA_GRAD_DIAGNOSTIC") == "1" and rank == 0:
+            from safetensors.torch import save_file
+            assert len(result) == 1, "Single-sample diagnostic only"
+            target = out / "loss_inputs"
+            target.mkdir(exist_ok=True)
+            loss = result[0]["loss_ctx"]["lm"].loss_kwargs
+            save_file({"labels": loss.shifted_labels.cpu().contiguous(),
+                       "weights": loss.loss_weight.cpu().contiguous()}, str(target / f"step_{step:03d}.safetensors"))
+        torch.cuda.synchronize()
+        self._engine._experiment_timer.__exit__(None, None, None)
+        self._engine._experiment_prepare_peak = torch.cuda.max_memory_allocated()
+        self._engine._experiment_prepare_reserved = torch.cuda.max_memory_reserved()
+        return result
 
     def train_record(self, batches):
         self._experiment_step = getattr(self, "_experiment_step", 0)
         if self._experiment_step == 0 and os.environ.get("TRAIN_INFRA_LOGITS_FIXTURE"):
             from experiments.train_infra.training_logits import capture_logits
             capture_logits(self.model, "xtuner", out, 0)
+        # Accumulate with input preparation, leaving the initial observation outside both timers.
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        self._experiment_timer = timer("train_step_seconds", self._experiment_timing)
+        self._experiment_timer.__enter__()
         diagnose = os.environ.get("TRAIN_INFRA_MEMORY_SNAPSHOT") == "1"
         if diagnose and self._experiment_step == 0:
             torch.cuda.memory._record_memory_history(max_entries=100000)
@@ -105,6 +137,10 @@ def install(precision_contexts):
                 stream.write(json.dumps({"step": self._experiment_step, "losses": values,
                                          "allocated_bytes": torch.cuda.memory_allocated()}) + "\n")
         handle = self.model.register_forward_hook(forward_losses)
+        gradients = None
+        if os.environ.get("TRAIN_INFRA_GRAD_DIAGNOSTIC") == "1":
+            from experiments.train_infra.gradient_diagnostic import BoundaryGradients
+            gradients = BoundaryGradients(self.model, "xtuner", out, self._experiment_step)
         print(f"STAGE rank={dist.get_rank()} step={self._experiment_step} forward_backward", flush=True)
         try:
             result = train(self, batches)
@@ -115,6 +151,8 @@ def install(precision_contexts):
             raise
         finally:
             handle.remove()
+        if gradients is not None:
+            gradients.close()
         loss = torch.tensor(result["total_loss"], device="cuda", dtype=torch.float64)
         dist.all_reduce(loss)
         # Native CE and balancing loss already report the global value on every rank.
@@ -135,10 +173,19 @@ def install(precision_contexts):
         lr = self.optimizer.param_groups[0]["lr"]
         print(f"STAGE rank={dist.get_rank()} step={self._experiment_step} optimizer lr={lr}", flush=True)
         result = optimize(self, norm)
+        torch.cuda.synchronize()
+        self._experiment_timer.__exit__(None, None, None)
         record = {"step": self._experiment_step, "loss": self._experiment_loss,
                   "grad_norm": float(norm), "lr": lr, "probe": probe_name,
                   "update_max_abs": float((local.detach() - before).abs().max()),
-                  "peak_memory_bytes": torch.cuda.max_memory_allocated()}
+                  "peak_memory_bytes": max(self._experiment_prepare_peak, torch.cuda.max_memory_allocated()),
+                  "peak_reserved_memory_bytes": max(self._experiment_prepare_reserved, torch.cuda.max_memory_reserved()),
+                  **self._experiment_timing,
+                  "train_tokens": self._experiment_tokens,
+                  "train_padded_tokens": self._experiment_padded_tokens,
+                  "train_tgs_local": self._experiment_tokens / self._experiment_timing["train_step_seconds"],
+                  "gradient_diagnostic_enabled": os.environ.get("TRAIN_INFRA_GRAD_DIAGNOSTIC") == "1",
+                  "timing_scope": "prepared_cpu_pack_through_optimizer; excludes_extra_logits"}
         with (out / f"metrics_rank{dist.get_rank()}.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
         self._experiment_step += 1

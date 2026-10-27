@@ -38,6 +38,9 @@ def main():
     steps = {s["expected_steps"] for s in statuses}
     assert len(steps) == 1
     total = steps.pop()
+    pack_lengths = {s["pack_length"] for s in statuses}
+    assert len(pack_lengths) == 1
+    pack_label = f"{pack_lengths.pop()} positions"
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
     reports = []
     rows = []
@@ -83,7 +86,7 @@ def main():
     axes[1, 1].set(xlabel="Completed optimizer updates", ylabel="Error (%)", xticks=[0,total])
     for ax in axes.flat:
         ax.legend(fontsize=8)
-    fig.suptitle(f"Fixed 8K pack before/after {total} real training steps; {profile_label}")
+    fig.suptitle(f"Fixed {pack_label} before/after {total} real training steps; {profile_label}")
     fig.savefig(args.out / "logits_before_after_training.png", dpi=180)
     with (args.out / "fixed_pack_token_errors.csv").open("w") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
@@ -114,7 +117,8 @@ def main():
     for panel in panels:
         panel.legend(fontsize=9)
         panel.grid(alpha=0.2)
-    overview.suptitle(f"{total} optimizer steps | GLM-5.3-Flash 4 layers, 8 GPUs, 8K | frozen ViT/projector, compile off\n{profile_label}")
+    sample_label = args.runs.name if args.runs.name in ("text", "image", "video_frames") else "Fixed pack"
+    overview.suptitle(f"{sample_label}: {total} optimizer steps | GLM-5.3-Flash 4 layers, 8 GPUs, {pack_label}\n{profile_label}; frozen ViT/projector, compile off")
     overview.savefig(args.out / "loss_logits_grad_norm.png", dpi=180)
     print(json.dumps(reports, indent=2))
 

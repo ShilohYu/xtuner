@@ -11,7 +11,7 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from experiments.train_infra.text_attention import _decoder_with_shared_hc_post, _text_mlp
+from experiments.train_infra.text_attention import _decoder_with_shared_hc_post, _text_mlp, _text_rms_norm
 
 
 @contextmanager
@@ -133,7 +133,7 @@ def native_dsa_precision(text: torch.nn.Module, backend: str, *, training: bool 
         if backend == "automodel":
             from nemo_automodel.components.models.glm5_next.layers import Glm5NextSparseAttention
 
-            report["projections"] = "own q_a, index wk/weights/compress: full-pack GEMM, native pools/select/core"
+            report["projections"] = "own q_a/kv_a, index wk/weights/compress: full-pack GEMM, native pools/select/core"
             for name, module in text.named_modules():
                 if isinstance(module, Glm5NextSparseAttention):
                     stack.enter_context(patch.object(module, "forward", _am_dsa_full_pack(module, training=training)))
@@ -166,6 +166,7 @@ def _am_dsa_full_pack(module: torch.nn.Module, *, training: bool = False) -> Cal
         assert not packed_context.cp_enabled
         values = {
             module.q_a_proj: module.q_a_proj(hidden_states),
+            module.kv_a_proj_with_mqa: module.kv_a_proj_with_mqa(hidden_states),
             module.indexer.wk: module.indexer.wk(hidden_states),
             module.indexer.weights_proj: module.indexer.weights_proj(hidden_states),
         }
@@ -286,7 +287,7 @@ def automodel_native_core_precision(
 
     report = {
         "mode": "AM primitives aligned to XT; native attention cores retained; diagnostic SP1",
-        "ordinary_rms_norm": "native AM / production XT HF-compatible precision",
+        "ordinary_rms_norm": "AM text uses XT native RMSNorm; affine before final cast; XT model unchanged",
         "gate_input": "float32",
         "packed_indices": "int32",
         "gate_prefix": "XT fixed 64-token scan",
@@ -316,6 +317,8 @@ def automodel_native_core_precision(
                 replacement = hyper_connection
             elif isinstance(module, layers._TorchRMSNormGated):
                 replacement = gated_norm
+            elif isinstance(module, layers.Glm5NextRMSNorm):
+                replacement = _text_rms_norm
             elif isinstance(module, layers.Glm5NextDecoderLayer):
                 replacement = _decoder_with_shared_hc_post
             elif isinstance(module, MLP) and module.activation == "swiglu" and module.swiglu_limit > 0:

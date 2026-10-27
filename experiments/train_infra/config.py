@@ -1,9 +1,9 @@
-"""GLM 四层对照：通用超参取自指定 Qwen .py；模型专属组件单独替换。"""
+"""GLM 四层对照：优化器跟随 glm53_flash_4layer_train_8gpu.py 的 Muon 配置。"""
 
 import os
 from pathlib import Path
 
-from xtuner.v1.config import AdamWConfig, FSDPConfig, LRConfig
+from xtuner.v1.config import FSDPConfig, LRConfig, MuonConfig
 from xtuner.v1.datasets import Glm53VLTokenizeFnConfig
 from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.loss import CELossConfig
@@ -24,7 +24,7 @@ image_token_budget = 16777216 // (14 * 2) ** 2
 loss_cfg = CELossConfig(mode="chunk", chunk_size=1024, loss_reduction="square")
 model_cfg = Glm53BaseConfig.from_hf(model_path)
 model_cfg.text_config.ep_size = 1
-model_cfg.text_config.dispatcher = "all2all"
+model_cfg.text_config.dispatcher = "deepep"
 model_cfg.text_config.lm_loss_cfg = loss_cfg
 model_cfg.text_config.attention.sparse_mla_backend = "flash_mla_cudnn"
 model_cfg.text_config.attention.indexer_backend = "tilelang"
@@ -55,8 +55,8 @@ trainer = TrainerConfig(
     # 【验证差异】每次从同一权重开始，禁止读取旧实验 checkpoint。
     strict_load=True, auto_resume=False,
     sp_size=sp_size, global_batch_size=8, intra_layer_micro_batch=1,
-    optim_cfg=AdamWConfig(lr=2e-5, weight_decay=0.05, foreach=False, swap_optimizer=False),
-    lr_cfg=LRConfig(lr_type="cosine", warmup_ratio=0.1, lr_min=1e-6),
+    optim_cfg=MuonConfig(lr=8e-6, weight_decay=0.1),
+    lr_cfg=LRConfig(lr_type="cosine", warmup_ratio=float(os.environ.get("TRAIN_INFRA_WARMUP", "0.1")), lr_min=1e-6),
     loss_cfg=loss_cfg,
     fsdp_cfg=FSDPConfig(ep_size=1, recompute_ratio=1.0,
                        torch_compile=compile_enabled, checkpoint_preserve_rng_state=False),

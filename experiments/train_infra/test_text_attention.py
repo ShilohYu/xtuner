@@ -13,6 +13,45 @@ from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.module.attention.kda import KimiDeltaAttention
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_am_native_norm_profile_matches_xt_and_restores_scope(dtype):
+    from experiments.train_infra.precision_profile import automodel_native_core_precision
+    from xtuner.v1.module.rms_norm import RMSNorm
+    from xtuner.v1.ops.rms_norm import native_rms_norm
+
+    torch.manual_seed(41)
+    xt = RMSNorm(64, eps=1e-5).to(dtype=dtype)
+    am = layers.Glm5NextRMSNorm(64, 1e-5, dtype)
+    visual = layers.Glm5NextRMSNorm(64, 1e-5, dtype)
+    with torch.no_grad():
+        xt.weight.uniform_(0.5, 1.5)
+        am.weight.copy_(xt.weight)
+        visual.weight.copy_(xt.weight)
+    x = torch.randn(2, 7, 64, dtype=dtype)
+    native_am = am.forward.__func__
+    baseline = am(x).detach()
+    parameters = [id(p) for p in am.parameters()]
+    if dtype == torch.bfloat16:
+        assert not torch.equal(baseline, xt(x)), "Fixture must expose the HF/native rounding difference"
+    assert xt.rms_norm_fn is native_rms_norm
+    with automodel_native_core_precision(torch.nn.ModuleList([am]), training=True) as report:
+        assert report["modules"]["0"] == "_text_rms_norm"
+        assert [id(p) for p in am.parameters()] == parameters
+        assert layers.Glm5NextRMSNorm.forward is native_am
+        torch.testing.assert_close(visual(x), baseline, atol=0, rtol=0)
+        a, b = (x.clone().requires_grad_() for _ in range(2))
+        ya, yb = xt(a), am(b)
+        torch.testing.assert_close(ya, yb, atol=0, rtol=0)
+        cotangent = torch.randn_like(ya)
+        ya.backward(cotangent)
+        yb.backward(cotangent)
+        torch.testing.assert_close(a.grad, b.grad, atol=0, rtol=0)
+        torch.testing.assert_close(xt.weight.grad, am.weight.grad, atol=0, rtol=0)
+    assert am.forward.__func__ is native_am
+    torch.testing.assert_close(am(x), baseline, atol=0, rtol=0)
+    assert xt.rms_norm_fn is native_rms_norm
+
+
 def test_xtuner_hf_norm_adapter_matches_independent_hf_forward_and_backward():
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextRMSNorm
     from xtuner.v1.module.rms_norm import RMSNorm
